@@ -1,0 +1,46 @@
+# Visual Studio / SSDT
+.vs/
+bin/
+obj/
+*.user
+*.suo
+*.dacpac
+*.jfm
+*.dbmdl
+*.publishxml
+
+# SQL Server
+*.bak
+*.trn
+*.mdf
+*.ldf
+*.ndf
+
+# Extended Events output
+*.xel
+*.xem
+
+# BCP / bulk data files
+*.dat
+*.bcp
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editors
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+!.vscode/settings.json
+!.vscode/extensions.json
+
+# PowerShell
+*.ps1xml
+
+# Temp
+*.tmp
+*.temp

@@ -1,0 +1,339 @@
+# ==============================================================================
+# Sample Azure DevOps Pipeline — SSDT Database Deployment with DBAOps
+#
+# This is a REFERENCE PIPELINE showing how the DBAOps templates are intended
+# to be used in a real SSDT project's CI/CD pipeline. It is not functional
+# as-is — you'll need to adapt it to your project structure, server names,
+# service connections, and variable groups.
+#
+# Deployment strategy:
+#   1. Build the dacpac from the SSDT project
+#   2. Deploy schema changes via dacpac publish (idempotent, Git is rollback)
+#   3. Run data update scripts from the RunOnce folder via sqlcmd
+#      - Scripts self-guard via deploy.RunOnceManifest — no pipeline logic
+#        needed to track what has already run
+#      - Failed scripts are recorded; retries are safe
+#   4. Each stage (Dev, Test, Prod) deploys to its own server
+#      - Each server has its own DBAOps instance
+#      - RunOnce scripts execute once per environment automatically
+#
+# Pipeline variables to configure:
+#   - sqlServerServiceConnection: Azure DevOps service connection for each env
+#   - serverName: target SQL Server instance
+#   - databaseName: target database
+#   - dbaOpsDatabase: name of the utility database (default: DBAOps)
+# ==============================================================================
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - src/Database/**
+
+pool:
+  vmImage: 'windows-latest'
+
+variables:
+  solution: 'src/Database/Database.sln'
+  buildConfiguration: 'Release'
+  dacpacPath: '$(Build.ArtifactStagingDirectory)/Database.dacpac'
+  dbaOpsDatabase: 'DBAOps'
+
+# ==============================================================================
+# BUILD STAGE
+# Compiles the SSDT project into a dacpac. This runs once regardless of how
+# many environments will be deployed to.
+# ==============================================================================
+
+stages:
+- stage: Build
+  displayName: 'Build dacpac'
+  jobs:
+  - job: BuildDacpac
+    displayName: 'Build SSDT project'
+    steps:
+
+    - task: VSBuild@1
+      displayName: 'Build SSDT solution'
+      inputs:
+        solution: '$(solution)'
+        configuration: '$(buildConfiguration)'
+
+    # Copy dacpac and RunOnce scripts to the artifact staging directory.
+    # The RunOnce folder contains data update scripts that use the
+    # DataUpdate_Script_Template — they self-guard via RunOnceManifest.
+
+    - task: CopyFiles@2
+      displayName: 'Stage dacpac'
+      inputs:
+        sourceFolder: 'src/Database/bin/$(buildConfiguration)'
+        contents: '*.dacpac'
+        targetFolder: '$(Build.ArtifactStagingDirectory)'
+
+    - task: CopyFiles@2
+      displayName: 'Stage RunOnce scripts'
+      inputs:
+        sourceFolder: 'src/Database/RunOnce'
+        contents: '**/*.sql'
+        targetFolder: '$(Build.ArtifactStagingDirectory)/RunOnce'
+
+    - publish: '$(Build.ArtifactStagingDirectory)'
+      displayName: 'Publish artifact'
+      artifact: 'DatabaseArtifact'
+
+# ==============================================================================
+# DEPLOY TO DEV
+# Schema changes via dacpac, then RunOnce data scripts via sqlcmd.
+# ==============================================================================
+
+- stage: Dev
+  displayName: 'Deploy to Dev'
+  dependsOn: Build
+  variables:
+    serverName: 'dev-sql-server.database.windows.net'
+    databaseName: 'MyDatabase'
+    sqlServerServiceConnection: 'DevSqlConnection'
+  jobs:
+  - deployment: DeployDev
+    displayName: 'Deploy to Dev'
+    environment: 'Dev'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+
+          - download: current
+            artifact: 'DatabaseArtifact'
+
+          # Step 1: Deploy schema changes via dacpac publish.
+          # CREATE OR ALTER procs are idempotent. Rollback = deploy previous commit.
+
+          - task: SqlAzureDacpacDeployment@1
+            displayName: 'Publish dacpac'
+            inputs:
+              azureSubscription: '$(sqlServerServiceConnection)'
+              serverName: '$(serverName)'
+              databaseName: '$(databaseName)'
+              deployType: 'DacpacTask'
+              dacpacFile: '$(Pipeline.Workspace)/DatabaseArtifact/Database.dacpac'
+              additionalArguments: '/p:BlockOnPossibleDataLoss=True'
+
+          # Step 2: Run data update scripts from RunOnce folder.
+          #
+          # Each script checks deploy.RunOnceManifest on startup:
+          #   - Already succeeded? → Skip (prints message, exits cleanly)
+          #   - Not yet run?       → Execute, register Success or Failed
+          #
+          # The pipeline does NOT need to track which scripts have run.
+          # The scripts are self-guarding. Just run them all every time.
+          #
+          # The DeploymentId is injected so the RunOnceManifest and
+          # RollbackManifest entries can be correlated back to this
+          # specific pipeline run.
+
+          - task: PowerShell@2
+            displayName: 'Run RunOnce data scripts'
+            inputs:
+              targetType: 'inline'
+              script: |
+                $scriptsPath = "$(Pipeline.Workspace)/DatabaseArtifact/RunOnce"
+
+                if (-not (Test-Path $scriptsPath)) {
+                    Write-Host "No RunOnce scripts found. Skipping."
+                    exit 0
+                }
+
+                $scripts = Get-ChildItem -Path $scriptsPath -Filter "*.sql" | Sort-Object Name
+                Write-Host "Found $($scripts.Count) RunOnce script(s)."
+
+                foreach ($script in $scripts) {
+                    Write-Host "--- Running: $($script.Name) ---"
+
+                    # The template's @DeploymentId variable is set via sqlcmd variable.
+                    # The script reads it as: SET @DeploymentId = '$(DeploymentId)'
+                    # when using SQLCMD mode, or via the template parameter prompt.
+
+                    sqlcmd `
+                        -S "$(serverName)" `
+                        -d "$(databaseName)" `
+                        -i "$($script.FullName)" `
+                        -v DeploymentId="PR-$(System.PullRequest.PullRequestId)" `
+                        -v UtilityDB="$(dbaOpsDatabase)" `
+                        -b
+
+                    if ($LASTEXITCODE -ne 0) {
+                        Write-Host "##vso[task.logissue type=error]Script failed: $($script.Name)"
+                        Write-Host "##vso[task.complete result=Failed;]"
+                        exit 1
+                    }
+
+                    Write-Host "--- Completed: $($script.Name) ---"
+                }
+
+# ==============================================================================
+# DEPLOY TO TEST
+# Same pattern as Dev. Scripts that already succeeded in Test are skipped.
+# ==============================================================================
+
+- stage: Test
+  displayName: 'Deploy to Test'
+  dependsOn: Dev
+  variables:
+    serverName: 'test-sql-server.database.windows.net'
+    databaseName: 'MyDatabase'
+    sqlServerServiceConnection: 'TestSqlConnection'
+  jobs:
+  - deployment: DeployTest
+    displayName: 'Deploy to Test'
+    environment: 'Test'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+
+          - download: current
+            artifact: 'DatabaseArtifact'
+
+          - task: SqlAzureDacpacDeployment@1
+            displayName: 'Publish dacpac'
+            inputs:
+              azureSubscription: '$(sqlServerServiceConnection)'
+              serverName: '$(serverName)'
+              databaseName: '$(databaseName)'
+              deployType: 'DacpacTask'
+              dacpacFile: '$(Pipeline.Workspace)/DatabaseArtifact/Database.dacpac'
+              additionalArguments: '/p:BlockOnPossibleDataLoss=True'
+
+          - task: PowerShell@2
+            displayName: 'Run RunOnce data scripts'
+            inputs:
+              targetType: 'inline'
+              script: |
+                $scriptsPath = "$(Pipeline.Workspace)/DatabaseArtifact/RunOnce"
+
+                if (-not (Test-Path $scriptsPath)) {
+                    Write-Host "No RunOnce scripts found. Skipping."
+                    exit 0
+                }
+
+                $scripts = Get-ChildItem -Path $scriptsPath -Filter "*.sql" | Sort-Object Name
+                Write-Host "Found $($scripts.Count) RunOnce script(s)."
+
+                foreach ($script in $scripts) {
+                    Write-Host "--- Running: $($script.Name) ---"
+                    sqlcmd `
+                        -S "$(serverName)" `
+                        -d "$(databaseName)" `
+                        -i "$($script.FullName)" `
+                        -v DeploymentId="PR-$(System.PullRequest.PullRequestId)" `
+                        -v UtilityDB="$(dbaOpsDatabase)" `
+                        -b
+
+                    if ($LASTEXITCODE -ne 0) {
+                        Write-Host "##vso[task.logissue type=error]Script failed: $($script.Name)"
+                        Write-Host "##vso[task.complete result=Failed;]"
+                        exit 1
+                    }
+
+                    Write-Host "--- Completed: $($script.Name) ---"
+                }
+
+# ==============================================================================
+# DEPLOY TO PROD
+# Requires manual approval (configured in the Azure DevOps environment).
+# Same script execution pattern — RunOnceManifest handles idempotency.
+# ==============================================================================
+
+- stage: Prod
+  displayName: 'Deploy to Prod'
+  dependsOn: Test
+  variables:
+    serverName: 'prod-sql-server.database.windows.net'
+    databaseName: 'MyDatabase'
+    sqlServerServiceConnection: 'ProdSqlConnection'
+  jobs:
+  - deployment: DeployProd
+    displayName: 'Deploy to Prod'
+    environment: 'Prod'    # Configure approval gates in Azure DevOps
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+
+          - download: current
+            artifact: 'DatabaseArtifact'
+
+          - task: SqlAzureDacpacDeployment@1
+            displayName: 'Publish dacpac'
+            inputs:
+              azureSubscription: '$(sqlServerServiceConnection)'
+              serverName: '$(serverName)'
+              databaseName: '$(databaseName)'
+              deployType: 'DacpacTask'
+              dacpacFile: '$(Pipeline.Workspace)/DatabaseArtifact/Database.dacpac'
+              additionalArguments: '/p:BlockOnPossibleDataLoss=True'
+
+          - task: PowerShell@2
+            displayName: 'Run RunOnce data scripts'
+            inputs:
+              targetType: 'inline'
+              script: |
+                $scriptsPath = "$(Pipeline.Workspace)/DatabaseArtifact/RunOnce"
+
+                if (-not (Test-Path $scriptsPath)) {
+                    Write-Host "No RunOnce scripts found. Skipping."
+                    exit 0
+                }
+
+                $scripts = Get-ChildItem -Path $scriptsPath -Filter "*.sql" | Sort-Object Name
+                Write-Host "Found $($scripts.Count) RunOnce script(s)."
+
+                foreach ($script in $scripts) {
+                    Write-Host "--- Running: $($script.Name) ---"
+                    sqlcmd `
+                        -S "$(serverName)" `
+                        -d "$(databaseName)" `
+                        -i "$($script.FullName)" `
+                        -v DeploymentId="PR-$(System.PullRequest.PullRequestId)" `
+                        -v UtilityDB="$(dbaOpsDatabase)" `
+                        -b
+
+                    if ($LASTEXITCODE -ne 0) {
+                        Write-Host "##vso[task.logissue type=error]Script failed: $($script.Name)"
+                        Write-Host "##vso[task.complete result=Failed;]"
+                        exit 1
+                    }
+
+                    Write-Host "--- Completed: $($script.Name) ---"
+                }
+
+# ==============================================================================
+# NOTES
+#
+# SQLCMD Variables:
+#   The DataUpdate_Script_Template uses SSMS template parameters (Ctrl-Shift-M
+#   syntax). For pipeline execution, either:
+#   a) Switch the template to use SQLCMD variables (:setvar / $(VarName))
+#   b) Pre-process the scripts to replace template parameters with values
+#   c) Have developers hardcode values when creating the script (simplest)
+#
+#   Option (c) is the pragmatic choice — the developer fills in the template
+#   parameters when creating the script, and the only pipeline-injected value
+#   is @DeploymentId which is set via sqlcmd -v.
+#
+# Approval Gates:
+#   Configure manual approvals on the 'Prod' environment in Azure DevOps
+#   under Pipelines > Environments > Prod > Approvals and checks.
+#
+# Rollback:
+#   Schema: Revert the commit and re-deploy. CREATE OR ALTER is idempotent.
+#   Data: Query deploy.RollbackManifest for the relevant ManifestId,
+#         then write a targeted UPDATE ... FROM using the rollback table.
+#
+# DBAOps Prerequisite:
+#   The DBAOps database must exist on each target server before the first
+#   pipeline run. Deploy it using the Setup/ scripts in this repo.
+#   This is a one-time setup per server, not a per-deployment step.
+# ==============================================================================
