@@ -8,12 +8,12 @@ A DBA operational utility database for SQL Server environments. Provides central
 
 ## Schema Layout
 
-| Schema    | Purpose                                                     | Owner          |
-|-----------|-------------------------------------------------------------|----------------|
-| `dbo`     | Ola Hallengren Maintenance Solution objects                 | Ola / dbatools |
-| `deploy`  | Deployment manifests, rollback data, run-once tracking      | DBA team       |
-| `trace`   | Extended Events targets, diagnostic log archives            | DBA team       |
-| `monitor` | (Future) Server health snapshots, wait stats, etc.          | DBA team       |
+| Schema    | Purpose                                                | Owner          |
+|-----------|--------------------------------------------------------|----------------|
+| `dbo`     | Ola Hallengren Maintenance Solution objects            | Ola / dbatools |
+| `deploy`  | Deployment manifests, rollback data, run-once tracking | DBA team       |
+| `trace`   | Extended Events targets, deadlock history              | DBA team       |
+| `monitor` | Server health snapshots, wait stats history            | DBA team       |
 
 ## Quick Start
 
@@ -146,46 +146,13 @@ SELECT * FROM [DBAOps].[deploy].[RollbackManifest] WHERE [Ticket] = 'PBI-12345';
 SELECT * FROM [DBAOps].[deploy].[RollbackManifest] WHERE [DeploymentId] = 'PR-678';
 ```
 
-## Maintenance
-
-### Rollback Cleanup
-
-```sql
--- Preview what would be cleaned up
-EXEC [deploy].[usp_CleanupRollbackData] @WhatIf = 1;
-
--- Run with defaults (30-day retention, 14-day grace period)
-EXEC [deploy].[usp_CleanupRollbackData];
-```
-
-### RunOnce Cleanup
-
-```sql
--- Preview what would be cleaned up
-EXEC [deploy].[usp_CleanupRunOnceManifest] @WhatIf = 1;
-
--- Run with defaults (90 days for failures, 365 for successes)
-EXEC [deploy].[usp_CleanupRunOnceManifest];
-
--- Keep success rows forever (safest — prevents accidental re-execution)
-EXEC [deploy].[usp_CleanupRunOnceManifest] @SuccessRetentionDays = -1;
-```
-
-Both procs can be scheduled as SQL Agent job steps (weekly recommended) or run manually.
-
-## Cloud Compatibility
-
-- **Azure SQL Database**: Contained by default. The setup scripts work as-is (skip `sp_configure` and `CONTAINMENT` settings).
-- **AWS RDS for SQL Server**: Supports `PARTIAL` containment. Run setup scripts normally.
-- **On-premises**: Run setup scripts in order. `contained database authentication` is enabled automatically.
-
 ## Trace Schema
 
 Diagnostic event capture for post-incident analysis.
 
 **Deadlock History** — `trace.DeadlockHistory` stores parsed deadlock graphs extracted from the `system_health` XE session. The `trace.usp_CaptureDeadlocks` proc pulls new events from the ring buffer and deduplicates against prior captures. Schedule every 5-15 minutes via SQL Agent.
 
-**XE Session Definitions** — Pre-built Extended Events sessions for blocked process reports and long-running query capture. These are template scripts (commented out by default) — review thresholds and enable as needed.
+**XE Session Definitions** — Pre-built Extended Events sessions for common diagnostic scenarios. `XEventSessions.sql` covers server-wide diagnostics (blocked process reports, long-running queries). `XEventSession_DatabaseActivity.sql` is a database-scoped activity audit for pre-migration audits, decommission planning, or connectivity troubleshooting. All are commented out by default — review thresholds and enable as needed.
 
 ```sql
 -- Check recent deadlocks
@@ -213,7 +180,13 @@ WHERE curr.SnapshotId = (SELECT MAX(SnapshotId) FROM [monitor].[WaitStatsSnapsho
 ORDER BY DeltaWaitMs DESC;
 ```
 
-## Maintenance Summary
+## Utility Scripts
+
+SSMS-ready scripts for common DBA tasks. Located in the `Utility/` directory.
+
+**SearchForString.sql** — parameterized search across object definitions (procs, functions, views, triggers), column names, all databases, and SQL Agent job step commands. Set `@SearchString` and run the section you need.
+
+## Maintenance
 
 All cleanup procs follow the same pattern: configurable retention, `@WhatIf` preview mode, safe defaults. Schedule as SQL Agent job steps (weekly recommended).
 
@@ -224,9 +197,13 @@ All cleanup procs follow the same pattern: configurable retention, `@WhatIf` pre
 | `usp_CleanupDeadlockHistory` | trace | 90 days | |
 | `usp_CleanupWaitStats` | monitor | 30 days | |
 
-## Customization
-
-The data update template uses `@UtilityDB` as a configurable variable defaulting to `DBAOps`. If your environment uses a different name, change this variable — no other modifications needed.
+```sql
+-- Preview any cleanup before running it
+EXEC [deploy].[usp_CleanupRollbackData] @WhatIf = 1;
+EXEC [deploy].[usp_CleanupRunOnceManifest] @WhatIf = 1;
+EXEC [trace].[usp_CleanupDeadlockHistory] @WhatIf = 1;
+EXEC [monitor].[usp_CleanupWaitStats] @WhatIf = 1;
+```
 
 ## CI/CD Integration
 
@@ -235,6 +212,18 @@ The `DataUpdate_Script_Template.sql` includes a `@DeploymentId` variable designe
 - **Azure DevOps**: `$(Build.BuildId)`, `PR-$(System.PullRequest.PullRequestId)`, `$(Release.ReleaseName)`
 - **GitHub Actions**: `${{ github.run_id }}`, `PR-${{ github.event.pull_request.number }}`
 - **Jenkins**: `${BUILD_NUMBER}`, `${CHANGE_ID}`
+
+A sample Azure DevOps pipeline is provided in `Samples/azure-pipelines-sample.yml` demonstrating the full Build → Dev → Test → Prod flow with dacpac deployment and self-guarding RunOnce script execution.
+
+## Cloud Compatibility
+
+- **Azure SQL Database**: Contained by default. Setup scripts work as-is (skip `sp_configure` and `CONTAINMENT` settings).
+- **AWS RDS for SQL Server**: Supports `PARTIAL` containment. Run setup scripts normally.
+- **On-premises**: Run setup scripts in order. `contained database authentication` is enabled automatically.
+
+## Customization
+
+The data update template uses `@UtilityDB` as a configurable variable defaulting to `DBAOps`. If your environment uses a different name, change this variable — no other modifications needed.
 
 ## Repository Structure
 
@@ -254,6 +243,7 @@ DBAOps/
 ├── Trace/
 │   ├── DeadlockHistory.sql
 │   ├── XEventSessions.sql
+│   ├── XEventSession_DatabaseActivity.sql
 │   └── usp_CleanupDeadlockHistory.sql
 ├── Monitor/
 │   ├── WaitStatsSnapshot.sql
@@ -263,6 +253,8 @@ DBAOps/
 │   ├── StoredProcedure_Template.sql
 │   ├── Server_Database_SprocName.sql
 │   └── Server_Database_ScriptName.sql
+├── Utility/
+│   └── SearchForString.sql
 └── Samples/
     └── azure-pipelines-sample.yml
 ```
