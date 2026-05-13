@@ -15,7 +15,7 @@
                                                           account write access -- run manually)
 
 .PARAMETER SqlInstance
-    Target SQL Server instance (e.g. GP-ENT-NEW\ENT).
+    Target SQL Server instance (e.g. <SqlInstance>).
 
 .PARAMETER IncludeSaCapturePipeline
     Also deploys the sa activity capture objects:
@@ -28,17 +28,17 @@
     Requires -IncludeSaCapturePipeline.
 
 .EXAMPLE
-    .\Deploy-DBAOps.ps1 -SqlInstance GP-ENT-NEW\ENT
+    .\Deploy-DBAOps.ps1 -SqlInstance <SqlInstance>
 
     Deploys core DBAOps objects only.
 
 .EXAMPLE
-    .\Deploy-DBAOps.ps1 -SqlInstance GP-ENT-NEW\ENT -IncludeSaCapturePipeline -CreateAgentJobs
+    .\Deploy-DBAOps.ps1 -SqlInstance <SqlInstance> -IncludeSaCapturePipeline -CreateAgentJobs
 
     Full deployment including the sa activity capture pipeline and Agent jobs.
 
 .EXAMPLE
-    .\Deploy-DBAOps.ps1 -SqlInstance GP-ENT-NEW\ENT -WhatIf
+    .\Deploy-DBAOps.ps1 -SqlInstance <SqlInstance> -WhatIf
 
     Shows which scripts would run without executing them.
 #>

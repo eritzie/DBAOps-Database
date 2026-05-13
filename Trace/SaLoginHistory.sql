@@ -37,7 +37,7 @@
     -- All SQL executed as sa on a specific instance
     SELECT [EventTime], [EventType], [AppName], [ClientHost], [DatabaseName], [SqlText]
     FROM [DBAOps].[trace].[SaLoginHistory]
-    WHERE [SourceInstance] = 'GP-ENT-NEW\ENT'
+    WHERE [SourceInstance] = '<SqlInstance>'
     ORDER BY [EventTime] DESC;
 
   Author  : Eric Ritzie

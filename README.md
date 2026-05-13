@@ -21,13 +21,13 @@ A DBA operational utility database for SQL Server environments. Provides central
 
 ```powershell
 # Core deployment only
-.\Deploy-DBAOps.ps1 -SqlInstance GP-ENT-NEW\ENT
+.\Deploy-DBAOps.ps1 -SqlInstance <SqlInstance>
 
 # Include sa activity capture pipeline + Agent jobs
-.\Deploy-DBAOps.ps1 -SqlInstance GP-ENT-NEW\ENT -IncludeSaCapturePipeline -CreateAgentJobs
+.\Deploy-DBAOps.ps1 -SqlInstance <SqlInstance> -IncludeSaCapturePipeline -CreateAgentJobs
 
 # Preview without executing
-.\Deploy-DBAOps.ps1 -SqlInstance GP-ENT-NEW\ENT -WhatIf
+.\Deploy-DBAOps.ps1 -SqlInstance <SqlInstance> -WhatIf
 ```
 
 The XE sessions (`XESessions\XEventSessions.sql`, `XESessions\XEventSession_DatabaseActivity.sql`, `XESessions\sa_activity_monitor.sql`) are excluded — they require manual review or instance-specific prerequisites before enabling.

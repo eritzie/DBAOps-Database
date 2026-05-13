@@ -1,0 +1,34 @@
+#!/bin/sh
+# Blocks commits that contain real server names or PII.
+# To add a new forbidden pattern, append a line to the PATTERNS list below.
+
+PATTERNS="
+GP-ENT-NEW
+@outdoornetwork\.com
+"
+
+STAGED=$(git diff --cached --name-only --diff-filter=ACM)
+if [ -z "$STAGED" ]; then
+    exit 0
+fi
+
+FOUND=0
+for FILE in $STAGED; do
+    # Skip this file -- it contains the forbidden patterns by design
+    [ "$FILE" = ".githooks/pre-commit" ] && continue
+    for PATTERN in $PATTERNS; do
+        [ -z "$PATTERN" ] && continue
+        MATCHES=$(git show ":$FILE" 2>/dev/null | grep -iE "$PATTERN" || true)
+        if [ -n "$MATCHES" ]; then
+            printf 'BLOCKED [%s] matched pattern "%s":\n' "$FILE" "$PATTERN"
+            printf '%s\n' "$MATCHES" | head -3
+            FOUND=1
+        fi
+    done
+done
+
+if [ "$FOUND" -ne 0 ]; then
+    printf '\nCommit blocked: remove server names and PII, then retry.\n'
+    exit 1
+fi
+exit 0
