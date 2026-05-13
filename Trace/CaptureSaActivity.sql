@@ -18,8 +18,8 @@
   Parameters
   ----------
     @XELogPath   NVARCHAR(260)  Path pattern for the .xel files on THIS instance.
-                                Defaults to 'C:\XELogs\sa_activity*.xel'.
-                                Change per instance if your XELogs path differs.
+                                Defaults to 'E:\XEvents\sa_activity*.xel'.
+                                Override for instances where the XE log folder differs (e.g. TEST-WMS-SQL uses C:\XEvents\).
 
     @Debug       BIT            1 = print row counts, skip INSERT (dry run).
                                 Default 0.
@@ -32,9 +32,9 @@
     -- Dry run -- shows what would be inserted without writing anything
     EXEC [DBAOps].[trace].[CaptureSaActivity] @Debug = 1;
 
-    -- Non-default XELogs path
+    -- Non-default path (e.g. TEST-WMS-SQL)
     EXEC [DBAOps].[trace].[CaptureSaActivity]
-        @XELogPath = N'D:\XELogs\sa_activity*.xel';
+        @XELogPath = N'C:\XEvents\sa_activity*.xel';
 
   Author  : Eric Ritzie
   Date    : 2026-05-13
@@ -46,7 +46,7 @@ USE [DBAOps];
 GO
 
 CREATE OR ALTER PROCEDURE [trace].[CaptureSaActivity]
-    @XELogPath   NVARCHAR(260) = N'C:\XELogs\sa_activity*.xel',
+    @XELogPath   NVARCHAR(260) = N'E:\XEvents\sa_activity*.xel',
     @Debug       BIT           = 0
 AS
 BEGIN
@@ -81,10 +81,11 @@ BEGIN
         xdr.value(''(action[@name="database_name"]/value)[1]'',   ''nvarchar(256)'')           AS DatabaseName,
         COALESCE(
             xdr.value(''(action[@name="sql_text"]/value)[1]'',    ''nvarchar(max)''),
-            xdr.value(''(action[@name="statement"]/value)[1]'',   ''nvarchar(max)'')
+            xdr.value(''(data[@name="statement"]/value)[1]'',     ''nvarchar(max)'')
         )                                                                                       AS SqlText
     FROM sys.fn_xe_file_target_read_file(N''' + @XELogPath + N''', NULL, NULL, NULL) f
-    CROSS APPLY (SELECT CAST(f.event_data AS XML)) AS x(xdr);
+    CROSS APPLY (SELECT CAST(f.event_data AS XML))        AS x(xml_data)
+    CROSS APPLY x.xml_data.nodes(''event'')               AS e(xdr);
     ';
 
     BEGIN TRY

@@ -20,22 +20,28 @@
     .\Deploy-SaActivityMonitor.ps1  (uncomment the Deploy-XESession call)
 
   Option 2 -- Manual per instance:
-    1. Create C:\XELogs\ on the target server (or adjust path below).
+    1. Create C:\XEvents\ on the target server (or adjust path below).
     2. Run this script.
     3. Verify: SELECT * FROM sys.dm_xe_sessions WHERE name = 'sa_activity_monitor'
     4. Run Setup\CreateAgentJobs.sql to create the capture and cleanup Agent jobs.
 
   XELogs folder
   -------------
-  Default path: C:\XELogs\
+  Default path: C:\XEvents\
   - Create this folder on each instance before deploying.
   - SQL Server service account needs write access.
-  - Grant: icacls "C:\XELogs" /grant "NT SERVICE\MSSQL$<instance>:(OI)(CI)F"
+  - Grant: icacls "C:\XEvents" /grant "NT SERVICE\MSSQL$<instance>:(OI)(CI)F"
     Adjust service account name per instance (see SQL Server Configuration Manager).
 
   Files: sa_activity_<timestamp>.xel  (100 MB per file, 10-file rollover = 1 GB max)
 ================================================================================
 */
+
+-- ============================================================================
+-- CONFIGURE: Set XE log path for this instance. Must end with a backslash.
+--            Requires SQLCMD mode (Query > SQLCMD Mode in SSMS).
+-- ============================================================================
+:setvar XELogsPath "C:\XEvents\"
 
 -- ============================================================================
 -- SESSION: Async File Target (permanent -- STARTUP_STATE = ON)
@@ -85,13 +91,12 @@ ADD EVENT sqlserver.rpc_completed(
         sqlserver.client_app_name,
         sqlserver.client_hostname,
         sqlserver.database_name,
-        sqlserver.server_principal_name,
-        sqlserver.statement
+        sqlserver.server_principal_name
     )
     WHERE sqlserver.server_principal_name = N'sa'
 )
 ADD TARGET package0.asynchronous_file_target(
-    SET filename           = N'C:\XELogs\sa_activity.xel',
+    SET filename           = N'$(XELogsPath)sa_activity.xel',
         max_file_size      = 100,    -- MB per file
         max_rollover_files = 10      -- 1 GB max total
 )
@@ -104,7 +109,7 @@ GO
 ALTER EVENT SESSION [sa_activity_monitor] ON SERVER STATE = START;
 GO
 
-PRINT 'sa_activity_monitor deployed and started (file target: C:\XELogs\sa_activity.xel).';
+PRINT 'sa_activity_monitor deployed and started (file target: $(XELogsPath)sa_activity.xel).';
 GO
 
 -- ============================================================================

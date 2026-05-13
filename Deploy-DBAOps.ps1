@@ -11,7 +11,7 @@
     Scripts intentionally excluded from this deploy:
       - Trace\XESessions\XEventSessions.sql              (review thresholds before enabling)
       - Trace\XESessions\XEventSession_DatabaseActivity.sql  (targeted, per-incident use)
-      - Trace\XESessions\sa_activity_monitor.sql         (requires C:\XELogs\ and service
+      - Trace\XESessions\sa_activity_monitor.sql         (requires XE log folder and service
                                                           account write access -- run manually)
 
 .PARAMETER SqlInstance
@@ -27,6 +27,10 @@
     Creates the two SQL Agent jobs for the sa activity pipeline.
     Requires -IncludeSaCapturePipeline.
 
+.PARAMETER XELogsPath
+    Path to the XE log folder on the target instance. Must end with a backslash.
+    Defaults to E:\XEvents\. Used by the Agent job step in 05_CreateAgentJobs.sql.
+
 .EXAMPLE
     .\Deploy-DBAOps.ps1 -SqlInstance <SqlInstance>
 
@@ -36,6 +40,11 @@
     .\Deploy-DBAOps.ps1 -SqlInstance <SqlInstance> -IncludeSaCapturePipeline -CreateAgentJobs
 
     Full deployment including the sa activity capture pipeline and Agent jobs.
+
+.EXAMPLE
+    .\Deploy-DBAOps.ps1 -SqlInstance <SqlInstance> -IncludeSaCapturePipeline -CreateAgentJobs -XELogsPath 'C:\XEvents\'
+
+    Full deployment for an instance where the XE log folder is on C:\.
 
 .EXAMPLE
     .\Deploy-DBAOps.ps1 -SqlInstance <SqlInstance> -WhatIf
@@ -49,7 +58,9 @@ param (
 
     [switch]$IncludeSaCapturePipeline,
 
-    [switch]$CreateAgentJobs
+    [switch]$CreateAgentJobs,
+
+    [string]$XELogsPath = 'E:\XEvents\'
 )
 
 Set-StrictMode -Version Latest
@@ -103,7 +114,9 @@ foreach ($relative in $scripts) {
 
     if ($PSCmdlet.ShouldProcess($SqlInstance, "Execute $relative")) {
         Write-Host "  --> $relative" -ForegroundColor Cyan
-        Invoke-DbaQuery -SqlInstance $SqlInstance -File $path -MessagesToOutput -EnableException
+        $sql = (Get-Content $path | Where-Object { $_ -notmatch '^\s*:' }) -join "`n"
+        $sql = $sql -replace [regex]::Escape('$(XELogsPath)'), $XELogsPath
+        Invoke-DbaQuery -SqlInstance $SqlInstance -Query $sql -MessagesToOutput -EnableException
     }
 }
 
@@ -112,8 +125,8 @@ if ($IncludeSaCapturePipeline) {
     Write-Warning @"
 sa_activity_monitor XE session was NOT deployed by this script.
 Before the capture job will produce data, run manually on each instance:
-  1. Create C:\XELogs\ and grant the SQL Server service account write access.
-  2. Execute Trace\XESessions\sa_activity_monitor.sql.
+  1. Create $XELogsPath and grant the SQL Server service account write access.
+  2. Set :setvar XELogsPath in sa_activity_monitor.sql to match, then execute it.
   3. Verify: SELECT * FROM sys.dm_xe_sessions WHERE name = 'sa_activity_monitor'
 "@
 }

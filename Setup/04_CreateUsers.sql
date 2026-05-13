@@ -56,7 +56,6 @@ BEGIN
     ALTER USER [DeployAgent] WITH DEFAULT_SCHEMA = [deploy];
     PRINT '***** Contained user [DeployAgent] created.';
 END
-GO
 
 -- Windows/AD contained user (alternative)
 -- CREATE USER [DOMAIN\SvcDeployAgent] WITH DEFAULT_SCHEMA = [deploy];
@@ -80,7 +79,6 @@ BEGIN
     ALTER USER [DBAReadUser] WITH DEFAULT_SCHEMA = [deploy];
     PRINT '***** Contained user [DBAReadUser] created.';
 END
-GO
 
 -- For a DBA who also needs to run cleanup (drop expired rollback tables):
 -- ALTER ROLE db_datawriter ADD MEMBER [DBAReadUser];

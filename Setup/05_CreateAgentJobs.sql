@@ -21,7 +21,7 @@
 
   Customization
   -------------
-    - Change @XELogPath in Step 1 if your XELogs folder differs from C:\XELogs\
+    - Pass -XELogsPath to Deploy-DBAOps.ps1 if your XE log folder differs from C:\XEvents\
     - Change @RetentionDays in Step 2 (default 90; consider 180 during remediation)
     - Change @owner_login_name once a dedicated service account replaces sa
 
@@ -63,9 +63,8 @@ EXEC msdb.dbo.sp_add_jobstep
     @step_id           = 1,
     @subsystem         = N'TSQL',
     @command           = N'
--- Adjust @XELogPath if your XELogs folder is not C:\XELogs\
 EXEC [DBAOps].[trace].[CaptureSaActivity]
-    @XELogPath = N''C:\XELogs\sa_activity*.xel'';
+    @XELogPath = N''$(XELogsPath)sa_activity*.xel'';
 ',
     @database_name     = N'DBAOps',
     @on_success_action = 1,   -- Quit with success
