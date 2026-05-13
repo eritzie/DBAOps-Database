@@ -19,7 +19,7 @@
 
 --Stored Procedure:
     DECLARE @SprocName nvarchar(1000);
-    SET @SprocName = '<Stored Procedure Name,nvarchar(1000),schema.usp_ProcName>';
+    SET @SprocName = '<Stored Procedure Name,nvarchar(1000),schema.ProcName>';
 
 --Description:
     DECLARE @Descrip nvarchar(255);

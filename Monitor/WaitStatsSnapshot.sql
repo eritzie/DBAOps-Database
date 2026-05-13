@@ -9,7 +9,7 @@ Description:
 
     Two components:
     1. monitor.WaitStatsSnapshot      — stores raw cumulative snapshots
-    2. monitor.usp_CaptureWaitStats   — proc to capture a snapshot (run on a schedule)
+    2. monitor.CaptureWaitStats   — proc to capture a snapshot (run on a schedule)
 
     To analyze deltas between two points in time, compare two snapshots:
 
@@ -81,10 +81,10 @@ ELSE
 GO
 
 -------------------------------------------------------------------------------
--- monitor.usp_CaptureWaitStats
+-- monitor.CaptureWaitStats
 -------------------------------------------------------------------------------
 
-CREATE OR ALTER PROCEDURE [monitor].[usp_CaptureWaitStats]
+CREATE OR ALTER PROCEDURE [monitor].[CaptureWaitStats]
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -160,5 +160,5 @@ BEGIN
 END
 GO
 
-PRINT '***** Procedure [monitor].[usp_CaptureWaitStats] created.';
+PRINT '***** Procedure [monitor].[CaptureWaitStats] created.';
 GO

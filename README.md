@@ -15,7 +15,24 @@ A DBA operational utility database for SQL Server environments. Provides central
 | `trace`   | Extended Events targets, deadlock history              | DBA team       |
 | `monitor` | Server health snapshots, wait stats history            | DBA team       |
 
-## Quick Start
+## Quick Deploy (PowerShell)
+
+`Deploy-DBAOps.ps1` runs all scripts in dependency order via dbatools. Stops on the first error.
+
+```powershell
+# Core deployment only
+.\Deploy-DBAOps.ps1 -SqlInstance GP-ENT-NEW\ENT
+
+# Include sa activity capture pipeline + Agent jobs
+.\Deploy-DBAOps.ps1 -SqlInstance GP-ENT-NEW\ENT -IncludeSaCapturePipeline -CreateAgentJobs
+
+# Preview without executing
+.\Deploy-DBAOps.ps1 -SqlInstance GP-ENT-NEW\ENT -WhatIf
+```
+
+The XE sessions (`XESessions\XEventSessions.sql`, `XESessions\XEventSession_DatabaseActivity.sql`, `XESessions\sa_activity_monitor.sql`) are excluded — they require manual review or instance-specific prerequisites before enabling.
+
+## Manual Deployment
 
 Run the setup scripts in order:
 
@@ -33,16 +50,27 @@ Run the setup scripts in order:
 :r Setup\04_CreateUsers.sql
 
 -- 5. Create deploy maintenance procedures
-:r Maintenance\usp_CleanupRollbackData.sql
-:r Maintenance\usp_CleanupRunOnceManifest.sql
+:r Maintenance\CleanupRollbackData.sql
+:r Maintenance\CleanupRunOnceManifest.sql
 
 -- 6. Create trace objects (deadlock history)
 :r Trace\DeadlockHistory.sql
-:r Trace\usp_CleanupDeadlockHistory.sql
+:r Trace\CleanupDeadlockHistory.sql
 
 -- 7. Create monitor objects (wait stats snapshots)
 :r Monitor\WaitStatsSnapshot.sql
-:r Monitor\usp_CleanupWaitStats.sql
+:r Monitor\CleanupWaitStats.sql
+
+-- 8. (Optional) sa activity capture pipeline -- run per instance during sa remediation
+--    a. Create C:\XELogs\ on the instance and grant SQL Server service account write access
+--    b. Deploy the XE session
+:r Trace\XESessions\sa_activity_monitor.sql
+--    c. Create the table and procs in DBAOps
+:r Trace\SaLoginHistory.sql
+:r Trace\CaptureSaActivity.sql
+:r Trace\CleanupSaActivity.sql
+--    d. Create the Agent jobs
+:r Setup\05_CreateAgentJobs.sql
 ```
 
 Install Ola Hallengren's Maintenance Solution:
@@ -150,24 +178,35 @@ SELECT * FROM [DBAOps].[deploy].[RollbackManifest] WHERE [DeploymentId] = 'PR-67
 
 Diagnostic event capture for post-incident analysis.
 
-**Deadlock History** — `trace.DeadlockHistory` stores parsed deadlock graphs extracted from the `system_health` XE session. The `trace.usp_CaptureDeadlocks` proc pulls new events from the ring buffer and deduplicates against prior captures. Schedule every 5-15 minutes via SQL Agent.
+**Deadlock History** — `trace.DeadlockHistory` stores parsed deadlock graphs extracted from the `system_health` XE session. The `trace.CaptureDeadlocks` proc pulls new events from the ring buffer and deduplicates against prior captures. Schedule every 5-15 minutes via SQL Agent.
 
 **XE Session Definitions** — Pre-built Extended Events sessions for common diagnostic scenarios. `XEventSessions.sql` covers server-wide diagnostics (blocked process reports, long-running queries). `XEventSession_DatabaseActivity.sql` is a database-scoped activity audit for pre-migration audits, decommission planning, or connectivity troubleshooting. All are commented out by default — review thresholds and enable as needed.
+
+**sa Activity Capture Pipeline** — `sa_activity_monitor.sql` deploys an XE file-target session that captures all logins, logouts, and SQL executed under the `sa` login. Events are read by `CaptureSaActivity` every 10 minutes (Agent job) and stored in `trace.SaLoginHistory`. Used as an interim audit control during application re-credentialing while `sa` cannot yet be disabled. `CleanupSaActivity` manages retention (default 90 days; consider 180 while remediation is active). Run `Setup\CreateAgentJobs.sql` on each instance to create both Agent jobs.
 
 ```sql
 -- Check recent deadlocks
 SELECT TOP 10 * FROM [DBAOps].[trace].[DeadlockHistory] ORDER BY [EventTime] DESC;
+
+-- Application inventory -- distinct app + host combinations using sa (remediation list)
+SELECT [SourceInstance], [AppName], [ClientHost],
+       COUNT(*) AS ConnectionCount,
+       MIN([EventTime]) AS FirstSeen, MAX([EventTime]) AS LastSeen
+FROM [DBAOps].[trace].[SaLoginHistory]
+WHERE [EventType] = 'login'
+GROUP BY [SourceInstance], [AppName], [ClientHost]
+ORDER BY [SourceInstance], ConnectionCount DESC;
 ```
 
 ## Monitor Schema
 
 Periodic server health snapshots for trend analysis.
 
-**Wait Stats Snapshots** — `monitor.WaitStatsSnapshot` stores cumulative wait stats from `sys.dm_os_wait_stats` with benign waits excluded (Paul Randal's standard exclusion list). The `monitor.usp_CaptureWaitStats` proc takes a snapshot. Schedule every 15-30 minutes. Analyze by computing deltas between two snapshot IDs.
+**Wait Stats Snapshots** — `monitor.WaitStatsSnapshot` stores cumulative wait stats from `sys.dm_os_wait_stats` with benign waits excluded (Paul Randal's standard exclusion list). The `monitor.CaptureWaitStats` proc takes a snapshot. Schedule every 15-30 minutes. Analyze by computing deltas between two snapshot IDs.
 
 ```sql
 -- Capture a snapshot
-EXEC [monitor].[usp_CaptureWaitStats];
+EXEC [monitor].[CaptureWaitStats];
 
 -- Top waits in the last snapshot interval
 SELECT TOP 10
@@ -192,17 +231,18 @@ All cleanup procs follow the same pattern: configurable retention, `@WhatIf` pre
 
 | Proc | Schema | Default Retention | Notes |
 |------|--------|-------------------|-------|
-| `usp_CleanupRollbackData` | deploy | 30 days + 14-day grace | Drops rollback data tables |
-| `usp_CleanupRunOnceManifest` | deploy | 90 days (Failed), 365 days (Success) | `-1` for indefinite Success retention |
-| `usp_CleanupDeadlockHistory` | trace | 90 days | |
-| `usp_CleanupWaitStats` | monitor | 30 days | |
+| `CleanupRollbackData` | deploy | 30 days + 14-day grace | Drops rollback data tables |
+| `CleanupRunOnceManifest` | deploy | 90 days (Failed), 365 days (Success) | `-1` for indefinite Success retention |
+| `CleanupDeadlockHistory` | trace | 90 days | |
+| `CleanupSaActivity` | trace | 90 days | Consider 180 days while sa remediation is active |
+| `CleanupWaitStats` | monitor | 30 days | |
 
 ```sql
 -- Preview any cleanup before running it
-EXEC [deploy].[usp_CleanupRollbackData] @WhatIf = 1;
-EXEC [deploy].[usp_CleanupRunOnceManifest] @WhatIf = 1;
-EXEC [trace].[usp_CleanupDeadlockHistory] @WhatIf = 1;
-EXEC [monitor].[usp_CleanupWaitStats] @WhatIf = 1;
+EXEC [deploy].[CleanupRollbackData] @WhatIf = 1;
+EXEC [deploy].[CleanupRunOnceManifest] @WhatIf = 1;
+EXEC [trace].[CleanupDeadlockHistory] @WhatIf = 1;
+EXEC [monitor].[CleanupWaitStats] @WhatIf = 1;
 ```
 
 ## CI/CD Integration
@@ -232,22 +272,29 @@ DBAOps/
 ├── README.md
 ├── LICENSE
 ├── .gitignore
+├── Deploy-DBAOps.ps1
 ├── Setup/
 │   ├── 01_CreateDatabase.sql
 │   ├── 02_CreateSchemas.sql
 │   ├── 03_CreateTables.sql
-│   └── 04_CreateUsers.sql
+│   ├── 04_CreateUsers.sql
+│   └── 05_CreateAgentJobs.sql
 ├── Maintenance/
-│   ├── usp_CleanupRollbackData.sql
-│   └── usp_CleanupRunOnceManifest.sql
+│   ├── CleanupRollbackData.sql
+│   └── CleanupRunOnceManifest.sql
 ├── Trace/
 │   ├── DeadlockHistory.sql
-│   ├── XEventSessions.sql
-│   ├── XEventSession_DatabaseActivity.sql
-│   └── usp_CleanupDeadlockHistory.sql
+│   ├── CleanupDeadlockHistory.sql
+│   ├── SaLoginHistory.sql
+│   ├── CaptureSaActivity.sql
+│   ├── CleanupSaActivity.sql
+│   └── XESessions/
+│       ├── XEventSessions.sql
+│       ├── XEventSession_DatabaseActivity.sql
+│       └── sa_activity_monitor.sql
 ├── Monitor/
 │   ├── WaitStatsSnapshot.sql
-│   └── usp_CleanupWaitStats.sql
+│   └── CleanupWaitStats.sql
 ├── Templates/
 │   ├── DataUpdate_Script_Template.sql
 │   ├── StoredProcedure_Template.sql

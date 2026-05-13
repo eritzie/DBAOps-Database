@@ -9,7 +9,7 @@ Description:
 
     Two components:
     1. trace.DeadlockHistory          — stores parsed deadlock events
-    2. trace.usp_CaptureDeadlocks     — proc to extract recent deadlocks from system_health
+    2. trace.CaptureDeadlocks     — proc to extract recent deadlocks from system_health
                                         and insert them into the history table
 
     The capture proc is designed to be run on a schedule (every 5-15 minutes via SQL Agent)
@@ -70,10 +70,10 @@ ELSE
 GO
 
 -------------------------------------------------------------------------------
--- trace.usp_CaptureDeadlocks
+-- trace.CaptureDeadlocks
 -------------------------------------------------------------------------------
 
-CREATE OR ALTER PROCEDURE [trace].[usp_CaptureDeadlocks]
+CREATE OR ALTER PROCEDURE [trace].[CaptureDeadlocks]
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -119,5 +119,5 @@ BEGIN
 END
 GO
 
-PRINT '***** Procedure [trace].[usp_CaptureDeadlocks] created.';
+PRINT '***** Procedure [trace].[CaptureDeadlocks] created.';
 GO
