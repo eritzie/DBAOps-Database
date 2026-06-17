@@ -1,0 +1,124 @@
+USE [DBAOps];
+GO
+
+/*===============================================================================================
+Copyright (C) 2026 Eric Ritzie. All rights reserved.
+
+Description:
+    Reads the DBAOps_SaActivityMonitor XE file target and inserts new events into
+    trace.SaLoginHistory. Deduplicates on EventTime, EventType, AppName, and ClientHost
+    to prevent double-inserts on re-run. Uses dynamic SQL because
+    fn_xe_file_target_read_file does not accept a variable path directly.
+
+Parameters:
+    @XELogPath   as NVARCHAR(260)   Glob path to the XE file target. Default: C:\XEvents\sa_activity*.xel
+    @Debug       as BIT             When 1, prints event counts without writing rows. Default: 0.
+
+Usage Example:
+    EXEC [trace].[CaptureSaActivity] @XELogPath = N'C:\XEvents\sa_activity*.xel';
+
+Change History:
+    Date        Author                           Description
+    ----------  -------------------------------  ------------------------------------
+    2026-06-08  Eric Ritzie (eritzie)            Initial creation
+===============================================================================================*/
+
+CREATE OR ALTER PROCEDURE [trace].[CaptureSaActivity]
+    @XELogPath   NVARCHAR(260) = N'C:\XEvents\sa_activity*.xel',
+    @Debug       BIT           = 0
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    DECLARE @RowsInserted INT = 0;
+    DECLARE @Sql          NVARCHAR(MAX);
+
+    -- == Parse XE file target into a temp table ===============================
+    -- fn_xe_file_target_read_file can't take a variable directly; use dynamic SQL.
+
+    IF OBJECT_ID(N'tempdb..#XEStaging') IS NOT NULL
+        DROP TABLE #XEStaging;
+
+    CREATE TABLE #XEStaging (
+        [EventTime]    DATETIME2(3)   NOT NULL,
+        [EventType]    VARCHAR(50)    NOT NULL,
+        [AppName]      NVARCHAR(256)  NULL,
+        [ClientHost]   NVARCHAR(256)  NULL,
+        [DatabaseName] NVARCHAR(256)  NULL,
+        [SqlText]      NVARCHAR(MAX)  NULL
+    );
+
+    SET @Sql = N'
+    INSERT INTO #XEStaging ([EventTime], [EventType], [AppName], [ClientHost], [DatabaseName], [SqlText])
+    SELECT
+        xdr.value(''@timestamp'',  ''datetime2'')                                              AS EventTime,
+        xdr.value(''@name'',       ''varchar(50)'')                                            AS EventType,
+        xdr.value(''(action[@name="client_app_name"]/value)[1]'', ''nvarchar(256)'')           AS AppName,
+        xdr.value(''(action[@name="client_hostname"]/value)[1]'', ''nvarchar(256)'')           AS ClientHost,
+        xdr.value(''(action[@name="database_name"]/value)[1]'',   ''nvarchar(256)'')           AS DatabaseName,
+        COALESCE(
+            xdr.value(''(action[@name="sql_text"]/value)[1]'',    ''nvarchar(max)''),
+            xdr.value(''(data[@name="statement"]/value)[1]'',     ''nvarchar(max)'')
+        )                                                                                       AS SqlText
+    FROM sys.fn_xe_file_target_read_file(N''' + @XELogPath + N''', NULL, NULL, NULL) f
+    CROSS APPLY (SELECT CAST(f.event_data AS XML))        AS x(xml_data)
+    CROSS APPLY x.xml_data.nodes(''event'')               AS e(xdr);
+    ';
+
+    BEGIN TRY
+        EXEC sp_executesql @Sql;
+    END TRY
+    BEGIN CATCH
+        DECLARE @Msg NVARCHAR(2048) = N'CaptureSaActivity: failed to read XE files from "'
+            + @XELogPath + N'". Error: ' + ERROR_MESSAGE();
+        RAISERROR(@Msg, 16, 1);
+        RETURN;
+    END CATCH;
+
+    IF @Debug = 1
+    BEGIN
+        DECLARE @Total   INT = (SELECT COUNT(*) FROM #XEStaging);
+        DECLARE @New     INT;
+
+        SELECT @New = COUNT(*)
+        FROM #XEStaging s
+        WHERE NOT EXISTS (
+            SELECT 1 FROM [trace].[SaLoginHistory] h
+            WHERE h.[EventTime]  = s.[EventTime]
+              AND h.[EventType]  = s.[EventType]
+              AND ISNULL(h.[AppName],    N'') = ISNULL(s.[AppName],    N'')
+              AND ISNULL(h.[ClientHost], N'') = ISNULL(s.[ClientHost], N'')
+        );
+
+        PRINT 'Debug mode -- no rows written.';
+        PRINT '  Events in file target : ' + CAST(@Total AS VARCHAR(10));
+        PRINT '  New (not yet stored)  : ' + CAST(@New   AS VARCHAR(10));
+        RETURN;
+    END;
+
+    -- == Insert new events only (dedup on natural key) ========================
+    INSERT INTO [trace].[SaLoginHistory]
+        ([EventTime], [EventType], [AppName], [ClientHost], [DatabaseName], [SqlText])
+    SELECT
+        s.[EventTime],
+        s.[EventType],
+        s.[AppName],
+        s.[ClientHost],
+        s.[DatabaseName],
+        s.[SqlText]
+    FROM #XEStaging s
+    WHERE NOT EXISTS (
+        SELECT 1 FROM [trace].[SaLoginHistory] h
+        WHERE h.[EventTime]  = s.[EventTime]
+          AND h.[EventType]  = s.[EventType]
+          AND ISNULL(h.[AppName],    N'') = ISNULL(s.[AppName],    N'')
+          AND ISNULL(h.[ClientHost], N'') = ISNULL(s.[ClientHost], N'')
+    );
+
+    SET @RowsInserted = @@ROWCOUNT;
+
+    IF @RowsInserted > 0
+        PRINT 'CaptureSaActivity: inserted ' + CAST(@RowsInserted AS VARCHAR(10)) + ' row(s).';
+
+END;

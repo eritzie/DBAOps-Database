@@ -1,0 +1,9 @@
+# Normalize all text files: store LF in repo, check out CRLF on Windows
+* text=auto eol=crlf
+
+# SQL Server binary artifacts — no line-ending handling, no text diff
+*.dacpac binary
+*.bak    binary
+*.mdf    binary
+*.ldf    binary
+*.ndf    binary

@@ -1,6 +1,6 @@
 # DBAOps
 
-A DBA operational utility database for SQL Server environments. Provides centralized storage for deployment tracking, maintenance logging, and diagnostic data.
+A DBA operational utility database for SQL Server environments. Provides centralized storage for deployment tracking, diagnostic event capture, server health monitoring, and schema change auditing.
 
 ## What Is This?
 
@@ -8,111 +8,171 @@ A DBA operational utility database for SQL Server environments. Provides central
 
 ## Schema Layout
 
-| Schema    | Purpose                                                | Owner          |
-|-----------|--------------------------------------------------------|----------------|
-| `dbo`     | Ola Hallengren Maintenance Solution objects            | Ola / dbatools |
-| `deploy`  | Deployment manifests, rollback data, run-once tracking | DBA team       |
-| `trace`   | Extended Events targets, deadlock history              | DBA team       |
-| `monitor` | Server health snapshots, wait stats history            | DBA team       |
+| Schema    | Purpose                                                          |
+|-----------|------------------------------------------------------------------|
+| `dbo`     | Instance-diagnostic utility procedures (DMV queries, no tables) |
+| `deploy`  | Deployment manifests, rollback data, run-once tracking           |
+| `trace`   | XE-backed event capture — deadlocks, blocking, RPC, sa activity |
+| `monitor` | Server health snapshots and wait statistics history              |
+| `audit`   | DDL and permission change history via database-scoped trigger    |
+| `maint`   | Reserved for future maintenance objects                          |
 
 ## Quick Deploy (PowerShell)
 
-`Deploy-DBAOps.ps1` runs all scripts in dependency order via dbatools. Stops on the first error.
+Requires the `dbatools` module. `Deploy-DBAOps.ps1` runs the numbered Setup scripts in dependency order and stops on the first error. Each Setup script uses SQLCMD `:r` includes so the individual object scripts remain the source of truth and can still be run standalone.
 
 ```powershell
-# Core deployment only
-.\Deploy-DBAOps.ps1 -SqlInstance <SqlInstance>
+# Core deployment (01 through 07)
+.\Deploy-DBAOps.ps1 -SqlInstance SQL-DEV-01
 
-# Include sa activity capture pipeline + Agent jobs
-.\Deploy-DBAOps.ps1 -SqlInstance <SqlInstance> -IncludeSaCapturePipeline -CreateAgentJobs
+# Core + all five Agent jobs
+.\Deploy-DBAOps.ps1 -SqlInstance SQL-DEV-01 -CreateAgentJobs
+
+# Non-default XE log path for the sa capture job
+.\Deploy-DBAOps.ps1 -SqlInstance SQL-DEV-01 -CreateAgentJobs -XELogsPath 'D:\XEvents\'
 
 # Preview without executing
-.\Deploy-DBAOps.ps1 -SqlInstance <SqlInstance> -WhatIf
+.\Deploy-DBAOps.ps1 -SqlInstance SQL-DEV-01 -WhatIf
 ```
 
-The XE sessions (`XESessions\XEventSessions.sql`, `XESessions\XEventSession_DatabaseActivity.sql`, `XESessions\sa_activity_monitor.sql`) are excluded — they require manual review or instance-specific prerequisites before enabling.
+**`Setup\09_CreateXESessions_MANUAL-SETUP.sql` is excluded from the automated deploy** — XE sessions require per-instance review of ring buffer sizes and file paths. Run it manually via SSMS (SQLCMD Mode) or `sqlcmd.exe` after reviewing the settings.
 
 ## Manual Deployment
 
-Run the setup scripts in order:
+Run the Setup scripts in order in SSMS with SQLCMD Mode enabled, or via `sqlcmd.exe`:
 
 ```sql
--- 1. Create the contained database
-:r Setup\01_CreateDatabase.sql
-
--- 2. Create schemas
-:r Setup\02_CreateSchemas.sql
-
--- 3. Create tables (RollbackManifest, RunOnceManifest)
-:r Setup\03_CreateTables.sql
-
--- 4. Create contained users (review and customize first)
-:r Setup\04_CreateUsers.sql
-
--- 5. Create deploy maintenance procedures
-:r Maintenance\CleanupRollbackData.sql
-:r Maintenance\CleanupRunOnceManifest.sql
-
--- 6. Create trace objects (deadlock history)
-:r Trace\DeadlockHistory.sql
-:r Trace\CleanupDeadlockHistory.sql
-
--- 7. Create monitor objects (wait stats snapshots)
-:r Monitor\WaitStatsSnapshot.sql
-:r Monitor\CleanupWaitStats.sql
-
--- 8. (Optional) sa activity capture pipeline -- run per instance during sa remediation
---    a. Create C:\XELogs\ on the instance and grant SQL Server service account write access
---    b. Deploy the XE session
-:r Trace\XESessions\sa_activity_monitor.sql
---    c. Create the table and procs in DBAOps
-:r Trace\SaLoginHistory.sql
-:r Trace\CaptureSaActivity.sql
-:r Trace\CleanupSaActivity.sql
---    d. Create the Agent jobs
-:r Setup\05_CreateAgentJobs.sql
+:r Setup\01_CreateDatabase.sql      -- contained database + SIMPLE recovery
+:r Setup\02_CreateSchemas.sql       -- all six operational schemas
+:r Setup\03_CreateTables.sql        -- all tables across deploy, trace, monitor, audit
+:r Setup\04_CreateProcedures.sql    -- all stored procedures across all schemas
+:r Setup\05_CreateTriggers.sql      -- trg_SchemaChangeCapture on DBAOps
+:r Setup\06_CreateUsers.sql         -- contained user template (customize before running)
+:r Setup\07_CreateRoles.sql         -- dr_RO, dr_RW, dr_RWE, dr_EO, dr_RE, dr_Del, dr_Deploy
+:r Setup\08_CreateAgentJobs.sql     -- all five DBAOps capture jobs (no schedules added)
+:r Setup\09_CreateXESessions_MANUAL-SETUP.sql    -- XE sessions (review per instance before enabling)
 ```
 
-Install Ola Hallengren's Maintenance Solution:
+Install Ola Hallengren's Maintenance Solution into the same database:
 
 ```powershell
-Install-DbaMaintenanceSolution -SqlInstance YourServer -Database DBAOps -InstallJobs -LogToTable -CleanupTime 168
+Install-DbaMaintenanceSolution -SqlInstance SQL-DEV-01 -Database DBAOps -InstallJobs -LogToTable -CleanupTime 168
 ```
 
-## Template Strategy
+## Capture Pipelines
 
-The repo provides two templates for two fundamentally different deployment scenarios:
+Four capture pipelines write diagnostic data into DBAOps. Each follows the same pattern: an XE session (manual deploy) feeds a capture proc, a cleanup proc manages retention, and an Agent job schedules both steps.
 
-**Data changes** (`DataUpdate_Script_Template.sql`) — one-time data fixes, backfills, migrations. These can't be rolled back from source control, so the template provides rollback data capture via `RollbackManifest` and run-once idempotency via `RunOnceManifest`. This is the heavy-duty template.
+| Pipeline | XE Session | Table | Capture Proc | Recommended Interval |
+|----------|-----------|-------|-------------|----------------------|
+| Deadlocks | `system_health` (built-in) | `trace.DeadlockHistory` | `trace.CaptureDeadlocks` | 5 min |
+| Blocking | `DBAOps_BlockedProcess` | `trace.BlockingHistory` | `trace.CaptureBlockingHistory` | 5 min |
+| RPC Execution | `DBAOps_SpExecutionCapture` | `trace.RpcExecutionHistory` | `trace.CaptureRpcExecutions` | 30–60 min |
+| sa Activity | `DBAOps_SaActivityMonitor` | `trace.SaLoginHistory` | `trace.CaptureSaActivity` | 10 min |
 
-**Schema changes** (`StoredProcedure_Template.sql`) — stored procedure deployments using `CREATE OR ALTER`. These are inherently idempotent and rollback is handled by deploying the previous version from Git. The template is a lightweight deployment wrapper with diagnostic header/footer logging. No manifest machinery needed.
+The deadlock pipeline runs immediately after deployment — it reads `system_health` which is always active. The other three require their XE sessions to be deployed first via `Setup\09_CreateXESessions_MANUAL-SETUP.sql`.
 
-Two additional lightweight templates are included for ad-hoc use outside of CI/CD pipelines:
+```sql
+-- Recent deadlocks
+SELECT TOP 10 [EventTime], [DatabaseName], [VictimProcess], [DeadlockGraph]
+FROM [DBAOps].[trace].[DeadlockHistory]
+ORDER BY [EventTime] DESC;
 
-| Template | Purpose |
-|----------|---------|
-| `Server_Database_SprocName.sql` | Minimal stored procedure — `CREATE OR ALTER`, `TRY/CATCH`, `THROW` |
-| `Server_Database_ScriptName.sql` | Lightweight ad-hoc data script with basic transaction safety |
+-- Active blocking chains
+SELECT TOP 10 [EventTime], [DatabaseName], [BlockedSpid], [BlockingSpid],
+              [BlockedWaitTime], [BlockingSql]
+FROM [DBAOps].[trace].[BlockingHistory]
+ORDER BY [EventTime] DESC;
+
+-- sa application inventory (remediation list)
+SELECT [SourceInstance], [AppName], [ClientHost],
+       COUNT(*) AS ConnectionCount,
+       MIN([EventTime]) AS FirstSeen, MAX([EventTime]) AS LastSeen
+FROM [DBAOps].[trace].[SaLoginHistory]
+WHERE [EventType] IN ('sql_batch_completed', 'rpc_completed')
+GROUP BY [SourceInstance], [AppName], [ClientHost]
+ORDER BY ConnectionCount DESC;
+```
+
+## Monitor Schema
+
+Periodic server health snapshots for trend analysis.
+
+`monitor.WaitStatsSnapshot` stores cumulative wait stats from `sys.dm_os_wait_stats` with benign waits excluded (Paul Randal's standard exclusion list). Analyze by computing deltas between two snapshot IDs.
+
+```sql
+-- Capture a snapshot manually
+EXEC [monitor].[CaptureWaitStats];
+
+-- Top waits in the last snapshot interval
+SELECT TOP 10
+    curr.[WaitType],
+    curr.[WaitTimeMs] - prev.[WaitTimeMs] AS DeltaWaitMs
+FROM [monitor].[WaitStatsSnapshot] curr
+    INNER JOIN [monitor].[WaitStatsSnapshot] prev
+        ON curr.[WaitType] = prev.[WaitType]
+       AND prev.[SnapshotId] = curr.[SnapshotId] - 1
+WHERE curr.[SnapshotId] = (SELECT MAX([SnapshotId]) FROM [monitor].[WaitStatsSnapshot])
+ORDER BY DeltaWaitMs DESC;
+```
+
+## Audit Schema
+
+`audit.SchemaChangeHistory` captures DDL changes (CREATE/ALTER/DROP) and permission changes (GRANT/REVOKE/DENY) via the `trg_SchemaChangeCapture` database-scoped trigger. Deployed to DBAOps itself by `Setup\05_CreateTriggers.sql`.
+
+To audit additional user databases, run `Triggers\trg_SchemaChangeCapture_MANUAL-SETUP.sql` against each target database — it creates the audit schema, table, and trigger in a single idempotent script. Use `Triggers\trg_SchemaChangeCapture.sql` (trigger only) on databases where the audit schema and table already exist.
+
+```sql
+-- Recent DDL changes in DBAOps
+SELECT TOP 20 [CapturedAt], [EventType], [SchemaName], [ObjectName], [LoginName], [TSQLCommand]
+FROM [DBAOps].[audit].[SchemaChangeHistory]
+ORDER BY [CapturedAt] DESC;
+```
+
+## dbo Utility Procedures
+
+19 read-only diagnostic procedures that query DMVs and system catalogs. No DBAOps table dependencies — they can be executed against any instance. Several accept `@Database` as `USER_DATABASES`, `ALL_DATABASES`, or a specific database name.
+
+| Procedure | Purpose |
+|-----------|---------|
+| `FindServerString` | Search SQL modules, Agent job steps, and linked servers for a string |
+| `GetBackupStatus` | Last backup date per database, overdue flag |
+| `GetBlockingSession` | Active blocking chains with SQL text |
+| `GetConnectionSummary` | Session counts grouped by database, login, host |
+| `GetFailedJob` | Agent jobs that failed within the last N hours |
+| `GetIndexFragmentation` | Fragmented indexes above threshold (SAMPLED mode) |
+| `GetLogSpaceUsage` | Transaction log size and percent used |
+| `GetLongRunningJob` | Jobs running longer than N× their average duration |
+| `GetLongRunningQuery` | Active requests exceeding elapsed seconds threshold |
+| `GetMissingIndex` | Missing index recommendations from plan cache |
+| `GetOpenTransaction` | Sessions with open transactions, including sleeping |
+| `GetReplicationStatus` | Distribution agent status (run on distributor) |
+| `GetSqlLoginAudit` | Password policy compliance, blank/weak passwords |
+| `GetSysadminMembers` | High-privilege role members and SA account status |
+| `GetTempdbConfig` | TempDB file configuration and autogrowth analysis |
+| `GetTempdbContention` | PAGELATCH waits on TempDB allocation pages |
+| `GetTopQuery` | Top queries by CPU, logical reads, or logical writes |
+| `GetUnusedIndex` | Non-clustered indexes with zero reads since last restart |
+| `GetVersionStoreUsage` | Version store space per database, snapshot isolation state |
+
+## Deployment Templates
+
+`Templates\` contains two templates for different deployment scenarios:
+
+**`DataUpdate_Script_Template.sql`** — data changes that can't be rolled back from source control. Provides rollback data capture via `deploy.RollbackManifest` and run-once idempotency via `deploy.RunOnceManifest`. Use for one-time data fixes, backfills, and migrations.
+
+**`StoredProcedure_Script_Template.sql`** — stored procedure deployments using `CREATE OR ALTER`. Inherently idempotent; rollback is deploying the previous version from Git. Includes a diagnostic header/footer.
 
 ## Run-Once System
 
-### How It Works
-
-Data update scripts are self-guarding. The template checks `deploy.RunOnceManifest` on startup — if a row exists with `Status = 'Success'` for that script name, execution is skipped. This means:
-
-- Scripts can live in the repo permanently without risk of re-execution
-- Failed runs are recorded but do not block retries
-- Each environment (Dev, Test, Prod) has its own `DBAOps` instance, so the same script runs once per environment automatically
-- No manual tracking, no archive folders, no pipeline write-back to the repo
-
-### Script Flow
+Data update scripts are self-guarding. On startup the script checks `deploy.RunOnceManifest` — if a row with `Status = 'Success'` exists for that script name, execution is skipped. Each environment (Dev, Test, Prod) has its own DBAOps instance so the same script runs once per environment automatically.
 
 ```
 Script starts
   → Check RunOnceManifest (already succeeded? → skip)
   → Check open transactions
   → Register in RollbackManifest
-  → Capture rollback data (SELECT INTO)
+  → Capture rollback data (SELECT INTO deploy.RB_<ManifestId>_<TableName>)
   → Print BEFORE image
   → Apply data change (TRY/CATCH)
   → Print AFTER image
@@ -125,43 +185,22 @@ On error:
   → Footer
 ```
 
-### Querying the RunOnce Manifest
-
 ```sql
 -- What has run on this server?
 SELECT * FROM [DBAOps].[deploy].[RunOnceManifest] ORDER BY [ExecutedAt] DESC;
 
--- Would a specific script run or skip?
+-- Would a script run or skip?
 SELECT * FROM [DBAOps].[deploy].[RunOnceManifest]
 WHERE [ScriptName] = 'DataUpdate_PBI4530_FixOrphanedAccounts.sql';
-
--- Everything from a specific pipeline run
-SELECT * FROM [DBAOps].[deploy].[RunOnceManifest] WHERE [DeploymentId] = 'PR-895';
 ```
 
-## Deployment Rollback System
+## Rollback System
 
-### How It Works
-
-When a data update script runs:
-
-1. A manifest row is inserted into `deploy.RollbackManifest` with deployment context (ticket, PR number, source table, etc.)
-2. The affected data is captured via `SELECT INTO` to a rollback table named `deploy.RB_<ManifestId>_<TableName>`
-3. The data change is applied inside a transaction
-4. If rollback is needed (even days later), the manifest points you to the exact rollback table
-
-### Lifecycle
+Before applying a data change, scripts capture the before-image via `SELECT INTO` to a table named `deploy.RB_<ManifestId>_<TableName>` and register in `deploy.RollbackManifest`. Even days later, the manifest points you to the exact snapshot table.
 
 ```
-Active → Expired → Archived (table dropped) → Purged (manifest row deleted, optional)
+Active → Expired → Archived (table dropped)
 ```
-
-- **Active**: Rollback data is available. Protected from cleanup.
-- **RolledBack**: Data was used to reverse a deployment.
-- **Expired**: Past retention period. Data table still exists during grace period.
-- **Archived**: Rollback table has been dropped. Manifest row retained for audit trail.
-
-### Querying the Rollback Manifest
 
 ```sql
 -- All active rollback entries
@@ -169,139 +208,49 @@ SELECT * FROM [DBAOps].[deploy].[RollbackManifest] WHERE [Status] = 'Active';
 
 -- Everything for a specific ticket
 SELECT * FROM [DBAOps].[deploy].[RollbackManifest] WHERE [Ticket] = 'PBI-12345';
-
--- Everything from a specific pipeline run
-SELECT * FROM [DBAOps].[deploy].[RollbackManifest] WHERE [DeploymentId] = 'PR-678';
 ```
 
-## Trace Schema
+## Cleanup Procedures
 
-Diagnostic event capture for post-incident analysis.
-
-**Deadlock History** — `trace.DeadlockHistory` stores parsed deadlock graphs extracted from the `system_health` XE session. The `trace.CaptureDeadlocks` proc pulls new events from the ring buffer and deduplicates against prior captures. Schedule every 5-15 minutes via SQL Agent.
-
-**XE Session Definitions** — Pre-built Extended Events sessions for common diagnostic scenarios. `XEventSessions.sql` covers server-wide diagnostics (blocked process reports, long-running queries). `XEventSession_DatabaseActivity.sql` is a database-scoped activity audit for pre-migration audits, decommission planning, or connectivity troubleshooting. All are commented out by default — review thresholds and enable as needed.
-
-**sa Activity Capture Pipeline** — `sa_activity_monitor.sql` deploys an XE file-target session that captures all logins, logouts, and SQL executed under the `sa` login. Events are read by `CaptureSaActivity` every 10 minutes (Agent job) and stored in `trace.SaLoginHistory`. Used as an interim audit control during application re-credentialing while `sa` cannot yet be disabled. `CleanupSaActivity` manages retention (default 90 days; consider 180 while remediation is active). Run `Setup\CreateAgentJobs.sql` on each instance to create both Agent jobs.
-
-```sql
--- Check recent deadlocks
-SELECT TOP 10 * FROM [DBAOps].[trace].[DeadlockHistory] ORDER BY [EventTime] DESC;
-
--- Application inventory -- distinct app + host combinations using sa (remediation list)
-SELECT [SourceInstance], [AppName], [ClientHost],
-       COUNT(*) AS ConnectionCount,
-       MIN([EventTime]) AS FirstSeen, MAX([EventTime]) AS LastSeen
-FROM [DBAOps].[trace].[SaLoginHistory]
-WHERE [EventType] = 'login'
-GROUP BY [SourceInstance], [AppName], [ClientHost]
-ORDER BY [SourceInstance], ConnectionCount DESC;
-```
-
-## Monitor Schema
-
-Periodic server health snapshots for trend analysis.
-
-**Wait Stats Snapshots** — `monitor.WaitStatsSnapshot` stores cumulative wait stats from `sys.dm_os_wait_stats` with benign waits excluded (Paul Randal's standard exclusion list). The `monitor.CaptureWaitStats` proc takes a snapshot. Schedule every 15-30 minutes. Analyze by computing deltas between two snapshot IDs.
-
-```sql
--- Capture a snapshot
-EXEC [monitor].[CaptureWaitStats];
-
--- Top waits in the last snapshot interval
-SELECT TOP 10
-    curr.WaitType,
-    curr.WaitTimeMs - prev.WaitTimeMs AS DeltaWaitMs
-FROM [monitor].[WaitStatsSnapshot] curr
-    INNER JOIN [monitor].[WaitStatsSnapshot] prev
-        ON curr.WaitType = prev.WaitType AND prev.SnapshotId = curr.SnapshotId - 1
-WHERE curr.SnapshotId = (SELECT MAX(SnapshotId) FROM [monitor].[WaitStatsSnapshot])
-ORDER BY DeltaWaitMs DESC;
-```
-
-## Utility Scripts
-
-SSMS-ready scripts for common DBA tasks. Located in the `Utility/` directory.
-
-**SearchForString.sql** — parameterized search across object definitions (procs, functions, views, triggers), column names, all databases, and SQL Agent job step commands. Set `@SearchString` and run the section you need.
-
-## Maintenance
-
-All cleanup procs follow the same pattern: configurable retention, `@WhatIf` preview mode, safe defaults. Schedule as SQL Agent job steps (weekly recommended).
+All cleanup procs support `@WhatIf = 1` to preview what would be removed. Schedule as SQL Agent job steps.
 
 | Proc | Schema | Default Retention | Notes |
 |------|--------|-------------------|-------|
-| `CleanupRollbackData` | deploy | 30 days + 14-day grace | Drops rollback data tables |
-| `CleanupRunOnceManifest` | deploy | 90 days (Failed), 365 days (Success) | `-1` for indefinite Success retention |
+| `CleanupRollbackData` | deploy | 30 days + 14-day grace | Two-phase: expire then drop data tables |
+| `CleanupRunOnceManifest` | deploy | 90 days (Failed), 365 days (Success) | Pass `-1` for indefinite Success retention |
 | `CleanupDeadlockHistory` | trace | 90 days | |
+| `CleanupBlockingHistory` | trace | 90 days | |
+| `CleanupRpcExecutionHistory` | trace | 90 days | Batched 5,000-row deletes |
 | `CleanupSaActivity` | trace | 90 days | Consider 180 days while sa remediation is active |
 | `CleanupWaitStats` | monitor | 30 days | |
 
 ```sql
--- Preview any cleanup before running it
-EXEC [deploy].[CleanupRollbackData] @WhatIf = 1;
-EXEC [deploy].[CleanupRunOnceManifest] @WhatIf = 1;
-EXEC [trace].[CleanupDeadlockHistory] @WhatIf = 1;
-EXEC [monitor].[CleanupWaitStats] @WhatIf = 1;
+-- Preview any cleanup before running
+EXEC [deploy].[CleanupRollbackData]      @WhatIf = 1;
+EXEC [deploy].[CleanupRunOnceManifest]   @WhatIf = 1;
+EXEC [trace].[CleanupDeadlockHistory]    @WhatIf = 1;
+EXEC [trace].[CleanupBlockingHistory]    @WhatIf = 1;
+EXEC [trace].[CleanupRpcExecutionHistory];   -- no @WhatIf; check row count first
+EXEC [trace].[CleanupSaActivity]         @WhatIf = 1;
+EXEC [monitor].[CleanupWaitStats]        @WhatIf = 1;
 ```
 
 ## CI/CD Integration
 
-The `DataUpdate_Script_Template.sql` includes a `@DeploymentId` variable designed for pipeline injection:
+The `DataUpdate_Script_Template.sql` includes a `@DeploymentId` variable for pipeline injection:
 
-- **Azure DevOps**: `$(Build.BuildId)`, `PR-$(System.PullRequest.PullRequestId)`, `$(Release.ReleaseName)`
+- **Azure DevOps**: `$(Build.BuildId)`, `PR-$(System.PullRequest.PullRequestId)`
 - **GitHub Actions**: `${{ github.run_id }}`, `PR-${{ github.event.pull_request.number }}`
 - **Jenkins**: `${BUILD_NUMBER}`, `${CHANGE_ID}`
 
-A sample Azure DevOps pipeline is provided in `Samples/azure-pipelines-sample.yml` demonstrating the full Build → Dev → Test → Prod flow with dacpac deployment and self-guarding RunOnce script execution.
+`Samples\azure-pipelines-sample.yml` demonstrates the full Build → Dev → Test → Prod flow with dacpac deployment and self-guarding RunOnce script execution.
 
 ## Cloud Compatibility
 
 - **Azure SQL Database**: Contained by default. Setup scripts work as-is (skip `sp_configure` and `CONTAINMENT` settings).
 - **AWS RDS for SQL Server**: Supports `PARTIAL` containment. Run setup scripts normally.
-- **On-premises**: Run setup scripts in order. `contained database authentication` is enabled automatically.
+- **On-premises**: Run setup scripts in order. `contained database authentication` is enabled automatically by `01_CreateDatabase.sql`.
 
 ## Customization
 
-The data update template uses `@UtilityDB` as a configurable variable defaulting to `DBAOps`. If your environment uses a different name, change this variable — no other modifications needed.
-
-## Repository Structure
-
-```
-DBAOps/
-├── README.md
-├── LICENSE
-├── .gitignore
-├── Deploy-DBAOps.ps1
-├── Setup/
-│   ├── 01_CreateDatabase.sql
-│   ├── 02_CreateSchemas.sql
-│   ├── 03_CreateTables.sql
-│   ├── 04_CreateUsers.sql
-│   └── 05_CreateAgentJobs.sql
-├── Maintenance/
-│   ├── CleanupRollbackData.sql
-│   └── CleanupRunOnceManifest.sql
-├── Trace/
-│   ├── DeadlockHistory.sql
-│   ├── CleanupDeadlockHistory.sql
-│   ├── SaLoginHistory.sql
-│   ├── CaptureSaActivity.sql
-│   ├── CleanupSaActivity.sql
-│   └── XESessions/
-│       ├── XEventSessions.sql
-│       ├── XEventSession_DatabaseActivity.sql
-│       └── sa_activity_monitor.sql
-├── Monitor/
-│   ├── WaitStatsSnapshot.sql
-│   └── CleanupWaitStats.sql
-├── Templates/
-│   ├── DataUpdate_Script_Template.sql
-│   ├── StoredProcedure_Template.sql
-│   ├── Server_Database_SprocName.sql
-│   └── Server_Database_ScriptName.sql
-├── Utility/
-│   └── SearchForString.sql
-└── Samples/
-    └── azure-pipelines-sample.yml
-```
+The data update template uses `@UtilityDB` defaulting to `DBAOps`. To use a different database name, change this variable — no other modifications needed.

@@ -4,50 +4,47 @@
     Deploys the DBAOps database and all core objects to a SQL Server instance.
 
 .DESCRIPTION
-    Runs the Setup, Maintenance, Trace, and Monitor scripts in dependency order.
-    Stops on the first error so a bad script does not let subsequent scripts run
-    against a partially deployed database.
+    Runs the numbered Setup scripts in order. Each Setup script uses SQLCMD :r includes
+    to reference the individual object scripts — the individual files remain the source
+    of truth and can still be run standalone via SSMS (SQLCMD Mode) or sqlcmd.exe.
 
     Scripts intentionally excluded from this deploy:
-      - Trace\XESessions\XEventSessions.sql              (review thresholds before enabling)
-      - Trace\XESessions\XEventSession_DatabaseActivity.sql  (targeted, per-incident use)
-      - Trace\XESessions\sa_activity_monitor.sql         (requires XE log folder and service
-                                                          account write access -- run manually)
+      - Setup\09_CreateXESessions_MANUAL-SETUP.sql    (review ring buffer sizes and file paths
+                                          per instance before enabling — run manually
+                                          in SSMS with SQLCMD Mode or via sqlcmd.exe)
 
 .PARAMETER SqlInstance
-    Target SQL Server instance (e.g. <SqlInstance>).
-
-.PARAMETER IncludeSaCapturePipeline
-    Also deploys the sa activity capture objects:
-      trace.SaLoginHistory, trace.CaptureSaActivity, trace.CleanupSaActivity.
-    The sa_activity_monitor XE session must be running before the Agent jobs
-    will produce data. Deploy it manually via Trace\XESessions\sa_activity_monitor.sql.
+    Target SQL Server instance (e.g. SQL-DEV-01).
 
 .PARAMETER CreateAgentJobs
-    Creates the two SQL Agent jobs for the sa activity pipeline.
-    Requires -IncludeSaCapturePipeline.
+    Runs Setup\08_CreateAgentJobs.sql, which creates all five DBAOps capture jobs.
+    Three jobs require XE sessions that are NOT deployed by this script:
+      - DBAOps - Capture - Blocking History  -> XESessions\DBAOps_BlockedProcess.sql
+      - DBAOps - Capture - RpcExecutions     -> XESessions\DBAOps_SpExecutionCapture.sql
+      - DBAOps - Capture - SaActivity        -> XESessions\DBAOps_SaActivityMonitor.sql
+    Run Setup\09_CreateXESessions_MANUAL-SETUP.sql manually after reviewing per-instance settings.
 
 .PARAMETER XELogsPath
     Path to the XE log folder on the target instance. Must end with a backslash.
-    Defaults to E:\XEvents\. Used by the Agent job step in 05_CreateAgentJobs.sql.
+    Defaults to C:\XEvents\. Substituted into the SaActivity Agent job step.
 
 .EXAMPLE
-    .\Deploy-DBAOps.ps1 -SqlInstance <SqlInstance>
+    .\Deploy-DBAOps.ps1 -SqlInstance SQL-DEV-01
 
-    Deploys core DBAOps objects only.
-
-.EXAMPLE
-    .\Deploy-DBAOps.ps1 -SqlInstance <SqlInstance> -IncludeSaCapturePipeline -CreateAgentJobs
-
-    Full deployment including the sa activity capture pipeline and Agent jobs.
+    Deploys core DBAOps objects (scripts 01 through 06 and 09).
 
 .EXAMPLE
-    .\Deploy-DBAOps.ps1 -SqlInstance <SqlInstance> -IncludeSaCapturePipeline -CreateAgentJobs -XELogsPath 'C:\XEvents\'
+    .\Deploy-DBAOps.ps1 -SqlInstance SQL-DEV-01 -CreateAgentJobs
 
-    Full deployment for an instance where the XE log folder is on C:\.
+    Full deployment including all five Agent jobs.
 
 .EXAMPLE
-    .\Deploy-DBAOps.ps1 -SqlInstance <SqlInstance> -WhatIf
+    .\Deploy-DBAOps.ps1 -SqlInstance SQL-DEV-01 -CreateAgentJobs -XELogsPath 'D:\XEvents\'
+
+    Full deployment for an instance where the XE log folder is on D:\.
+
+.EXAMPLE
+    .\Deploy-DBAOps.ps1 -SqlInstance SQL-DEV-01 -WhatIf
 
     Shows which scripts would run without executing them.
 #>
@@ -56,50 +53,61 @@ param (
     [Parameter(Mandatory)]
     [string]$SqlInstance,
 
-    [switch]$IncludeSaCapturePipeline,
-
     [switch]$CreateAgentJobs,
 
-    [string]$XELogsPath = 'E:\XEvents\'
+    [string]$XELogsPath = 'C:\XEvents\'
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-if ($CreateAgentJobs -and -not $IncludeSaCapturePipeline) {
-    throw '-CreateAgentJobs requires -IncludeSaCapturePipeline.'
-}
-
 $root = $PSScriptRoot
+
+#
+# Expand-SqlIncludes
+# Recursively resolves SQLCMD :r directives so Invoke-DbaQuery receives plain SQL.
+# Other SQLCMD directives (:setvar, :on error, etc.) are stripped.
+#
+function Expand-SqlIncludes {
+    param(
+        [Parameter(Mandatory)]
+        [string]$FilePath
+    )
+
+    $dir     = Split-Path $FilePath -Parent
+    $lines   = Get-Content $FilePath
+
+    $expanded = foreach ($line in $lines) {
+        if ($line -match '^\s*:r\s+(.+)$') {
+            $includePath = Join-Path $dir $Matches[1].Trim()
+            Expand-SqlIncludes -FilePath $includePath
+        }
+        elseif ($line -match '^\s*:') {
+            # Strip other SQLCMD directives (:setvar, :on error, etc.)
+        }
+        else {
+            $line
+        }
+    }
+
+    $expanded -join "`n"
+}
 
 $coreScripts = @(
     'Setup\01_CreateDatabase.sql',
     'Setup\02_CreateSchemas.sql',
     'Setup\03_CreateTables.sql',
-    'Setup\04_CreateUsers.sql',
-    'Maintenance\CleanupRollbackData.sql',
-    'Maintenance\CleanupRunOnceManifest.sql',
-    'Trace\DeadlockHistory.sql',
-    'Trace\CleanupDeadlockHistory.sql',
-    'Monitor\WaitStatsSnapshot.sql',
-    'Monitor\CleanupWaitStats.sql'
-)
-
-$saScripts = @(
-    'Trace\SaLoginHistory.sql',
-    'Trace\CaptureSaActivity.sql',
-    'Trace\CleanupSaActivity.sql'
+    'Setup\04_CreateProcedures.sql',
+    'Setup\05_CreateTriggers.sql',
+    'Setup\06_CreateUsers.sql',
+    'Setup\07_CreateRoles.sql'
 )
 
 $scripts = [System.Collections.Generic.List[string]]::new()
 $scripts.AddRange([string[]]$coreScripts)
 
-if ($IncludeSaCapturePipeline) {
-    $scripts.AddRange([string[]]$saScripts)
-}
-
 if ($CreateAgentJobs) {
-    $scripts.Add('Setup\05_CreateAgentJobs.sql')
+    $scripts.Add('Setup\08_CreateAgentJobs.sql')
 }
 
 Write-Host "DBAOps deployment -> $SqlInstance" -ForegroundColor White
@@ -114,20 +122,21 @@ foreach ($relative in $scripts) {
 
     if ($PSCmdlet.ShouldProcess($SqlInstance, "Execute $relative")) {
         Write-Host "  --> $relative" -ForegroundColor Cyan
-        $sql = (Get-Content $path | Where-Object { $_ -notmatch '^\s*:' }) -join "`n"
+        $sql = Expand-SqlIncludes -FilePath $path
         $sql = $sql -replace [regex]::Escape('$(XELogsPath)'), $XELogsPath
         Invoke-DbaQuery -SqlInstance $SqlInstance -Query $sql -MessagesToOutput -EnableException
     }
 }
 
-if ($IncludeSaCapturePipeline) {
+if ($CreateAgentJobs) {
     Write-Host ''
     Write-Warning @"
-sa_activity_monitor XE session was NOT deployed by this script.
-Before the capture job will produce data, run manually on each instance:
-  1. Create $XELogsPath and grant the SQL Server service account write access.
-  2. Set :setvar XELogsPath in sa_activity_monitor.sql to match, then execute it.
-  3. Verify: SELECT * FROM sys.dm_xe_sessions WHERE name = 'sa_activity_monitor'
+Three Agent jobs require XE sessions that were NOT deployed by this script:
+  - DBAOps - Capture - Blocking History  -> XESessions\DBAOps_BlockedProcess.sql
+  - DBAOps - Capture - RpcExecutions     -> XESessions\DBAOps_SpExecutionCapture.sql
+  - DBAOps - Capture - SaActivity        -> XESessions\DBAOps_SaActivityMonitor.sql
+Run Setup\09_CreateXESessions_MANUAL-SETUP.sql manually after reviewing per-instance settings.
+Jobs 'DBAOps - Capture - Deadlocks' and 'DBAOps - Capture - WaitStats' are ready immediately.
 "@
 }
 

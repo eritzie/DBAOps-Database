@@ -41,6 +41,19 @@ Desktop.ini
 # PowerShell
 *.ps1xml
 
+# Logs
+*.log
+
+# Environment / secrets
+*.env
+
+# Workflow planning docs (not part of the deliverable)
+handoff-sync-from-odn.md
+
+# Claude Code
+CLAUDE.local.md
+.claude/settings.local.json
+
 # Temp
 *.tmp
 *.temp

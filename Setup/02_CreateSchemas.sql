@@ -3,21 +3,22 @@
 DBAOps Database - Setup Script 02: Create Schemas
 
 Description:
-    Creates operational schemas within DBAOps. Each schema scopes a distinct area
-    of DBA operations.
+    Creates the DBAOps operational schemas by including the individual schema scripts
+    from Security\Schema\. Each script uses IF NOT EXISTS so this is safe to re-run.
 
-    Schema layout:
-        deploy      - Deployment rollback tracking (RollbackManifest, rollback data tables)
-        trace       - Extended Events targets, diagnostic log archives
-        monitor     - (Future) Server health snapshots, wait stats history, etc.
+    deploy   Deployment manifests, rollback data tables, run-once tracking
+    trace    Extended Events capture (deadlocks, blocking, RPC, sa activity)
+    monitor  Server health snapshots, wait statistics history
+    audit    DDL and permission change history (SchemaChangeHistory)
+    maint    Reserved for future maintenance objects
 
 Prerequisites:
     - Run 01_CreateDatabase.sql first
-    - Execute in the context of [DBAOps]
 
 Change History:
     Date        Author          Description                          Ticket
     ----------  --------------  -----------------------------------  --------
+    2026-06-17  Eric Ritzie     Convert to :r include pattern
 
 ===================================================================================================
 */
@@ -25,35 +26,11 @@ Change History:
 USE [DBAOps];
 GO
 
--- deploy: Deployment rollback tracking
-IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE [name] = N'deploy')
-BEGIN
-    EXEC('CREATE SCHEMA [deploy] AUTHORIZATION [dbo]');
-    PRINT '***** Schema [deploy] created.';
-END
-ELSE
-    PRINT '***** Schema [deploy] already exists.';
-GO
-
--- trace: Diagnostic and trace data
-IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE [name] = N'trace')
-BEGIN
-    EXEC('CREATE SCHEMA [trace] AUTHORIZATION [dbo]');
-    PRINT '***** Schema [trace] created.';
-END
-ELSE
-    PRINT '***** Schema [trace] already exists.';
-GO
-
--- monitor: Future use — server health, wait stats, etc.
-IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE [name] = N'monitor')
-BEGIN
-    EXEC('CREATE SCHEMA [monitor] AUTHORIZATION [dbo]');
-    PRINT '***** Schema [monitor] created.';
-END
-ELSE
-    PRINT '***** Schema [monitor] already exists.';
-GO
+:r ..\Security\Schemas\deploy.sql
+:r ..\Security\Schemas\trace.sql
+:r ..\Security\Schemas\monitor.sql
+:r ..\Security\Schemas\audit.sql
+:r ..\Security\Schemas\maint.sql
 
 PRINT '***** Schema setup complete.';
 GO
