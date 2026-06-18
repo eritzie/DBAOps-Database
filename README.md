@@ -14,12 +14,12 @@ A DBA operational utility database for SQL Server environments. Provides central
 | `deploy`  | Deployment manifests, rollback data, run-once tracking           |
 | `trace`   | XE-backed event capture — deadlocks, blocking, RPC, sa activity |
 | `monitor` | Server health snapshots and wait statistics history              |
-| `audit`   | DDL and permission change history via database-scoped trigger    |
+| `audit`   | DDL change history (XE ring buffer) and sa login event capture   |
 | `maint`   | Reserved for future maintenance objects                          |
 
 ## Quick Deploy (PowerShell)
 
-Requires the `dbatools` module. `Deploy-DBAOps.ps1` runs the numbered Setup scripts in dependency order and stops on the first error. Each Setup script uses SQLCMD `:r` includes so the individual object scripts remain the source of truth and can still be run standalone.
+Requires the `dbatools` module. `Deploy-DBAOps.ps1` runs the numbered Setup scripts in dependency order and stops on the first error.
 
 ```powershell
 # Core deployment (01 through 07)
@@ -35,21 +35,21 @@ Requires the `dbatools` module. `Deploy-DBAOps.ps1` runs the numbered Setup scri
 .\Deploy-DBAOps.ps1 -SqlInstance SQL-DEV-01 -WhatIf
 ```
 
-**`Setup\09_CreateXESessions_MANUAL-SETUP.sql` is excluded from the automated deploy** — XE sessions require per-instance review of ring buffer sizes and file paths. Run it manually via SSMS (SQLCMD Mode) or `sqlcmd.exe` after reviewing the settings.
+**`Setup\09_CreateXESessions_MANUAL-SETUP.sql` is excluded from the automated deploy** — XE sessions require per-instance review of ring buffer sizes and file paths. Run it manually via SSMS or `sqlcmd.exe` after reviewing the settings.
 
 ## Manual Deployment
 
-Run the Setup scripts in order in SSMS with SQLCMD Mode enabled, or via `sqlcmd.exe`:
+Run the Setup scripts in order in SSMS or via `sqlcmd.exe`:
 
 ```sql
 :r Setup\01_CreateDatabase.sql      -- contained database + SIMPLE recovery
 :r Setup\02_CreateSchemas.sql       -- all six operational schemas
 :r Setup\03_CreateTables.sql        -- all tables across deploy, trace, monitor, audit
 :r Setup\04_CreateProcedures.sql    -- all stored procedures across all schemas
-:r Setup\05_CreateTriggers.sql      -- trg_SchemaChangeCapture on DBAOps
+:r Setup\05_CreateTriggers.sql      -- trg_SchemaChangeCapture on DBAOps (legacy DDL trigger)
 :r Setup\06_CreateUsers.sql         -- contained user template (customize before running)
 :r Setup\07_CreateRoles.sql         -- dr_RO, dr_RW, dr_RWE, dr_EO, dr_RE, dr_Del, dr_Deploy
-:r Setup\08_CreateAgentJobs.sql     -- all five DBAOps capture jobs (no schedules added)
+:r Setup\08_CreateAgentJobs.sql     -- five DBAOps capture jobs (no schedules added)
 :r Setup\09_CreateXESessions_MANUAL-SETUP.sql    -- XE sessions (review per instance before enabling)
 ```
 
@@ -61,16 +61,18 @@ Install-DbaMaintenanceSolution -SqlInstance SQL-DEV-01 -Database DBAOps -Install
 
 ## Capture Pipelines
 
-Four capture pipelines write diagnostic data into DBAOps. Each follows the same pattern: an XE session (manual deploy) feeds a capture proc, a cleanup proc manages retention, and an Agent job schedules both steps.
+Six capture pipelines write diagnostic data into DBAOps. Each follows the same pattern: an XE session (manual deploy) feeds a capture proc, a cleanup proc manages retention, and an Agent job schedules both steps.
 
-| Pipeline | XE Session | Table | Capture Proc | Recommended Interval |
-|----------|-----------|-------|-------------|----------------------|
-| Deadlocks | `system_health` (built-in) | `trace.DeadlockHistory` | `trace.CaptureDeadlocks` | 5 min |
-| Blocking | `DBAOps_BlockedProcess` | `trace.BlockingHistory` | `trace.CaptureBlockingHistory` | 5 min |
-| RPC Execution | `DBAOps_SpExecutionCapture` | `trace.RpcExecutionHistory` | `trace.CaptureRpcExecutions` | 30–60 min |
-| sa Activity | `DBAOps_SaActivityMonitor` | `trace.SaLoginHistory` | `trace.CaptureSaActivity` | 10 min |
+| Pipeline | Schema | XE Session | Table | Capture Proc | Recommended Interval |
+|----------|--------|-----------|-------|-------------|----------------------|
+| Deadlocks | `trace` | `system_health` (built-in) | `trace.DeadlockHistory` | `trace.CaptureDeadlocks` | 5 min |
+| Blocking | `trace` | `DBAOps_BlockedProcess` | `trace.BlockingHistory` | `trace.CaptureBlockingHistory` | 5 min |
+| RPC Execution | `trace` | `DBAOps_SpExecutionCapture` | `trace.RpcExecutionHistory` | `trace.CaptureRpcExecutions` | 30–60 min |
+| sa Activity | `trace` | `DBAOps_SaActivityMonitor` (file target, optional) | `trace.SaLoginHistory` | `trace.CaptureSaActivity` | 10 min |
+| sa Activity | `audit` | `DBAOps_SaActivityMonitor` (ring buffer) | `audit.SaLoginHistory` | `audit.CaptureSaActivity` | 5 min |
+| Schema Changes | `audit` | `DBAOps_SchemaChange` (ring buffer) | `audit.SchemaChangeHistory` | `audit.CaptureSchemaChanges` | 5 min |
 
-The deadlock pipeline runs immediately after deployment — it reads `system_health` which is always active. The other three require their XE sessions to be deployed first via `Setup\09_CreateXESessions_MANUAL-SETUP.sql`.
+The deadlock pipeline is ready immediately after deployment — it reads `system_health` which is always active. All others require their XE sessions to be deployed first. The `audit` sa activity pipeline is the successor to the `trace` version — it reads from the ring buffer and does not require a file system path.
 
 ```sql
 -- Recent deadlocks
@@ -88,7 +90,7 @@ ORDER BY [EventTime] DESC;
 SELECT [SourceInstance], [AppName], [ClientHost],
        COUNT(*) AS ConnectionCount,
        MIN([EventTime]) AS FirstSeen, MAX([EventTime]) AS LastSeen
-FROM [DBAOps].[trace].[SaLoginHistory]
+FROM [DBAOps].[audit].[SaLoginHistory]
 WHERE [EventType] IN ('sql_batch_completed', 'rpc_completed')
 GROUP BY [SourceInstance], [AppName], [ClientHost]
 ORDER BY ConnectionCount DESC;
@@ -118,15 +120,27 @@ ORDER BY DeltaWaitMs DESC;
 
 ## Audit Schema
 
-`audit.SchemaChangeHistory` captures DDL changes (CREATE/ALTER/DROP) and permission changes (GRANT/REVOKE/DENY) via the `trg_SchemaChangeCapture` database-scoped trigger. Deployed to DBAOps itself by `Setup\05_CreateTriggers.sql`.
+`audit.SchemaChangeHistory` captures DDL object changes (CREATE/ALTER/DROP) across all user databases via the `DBAOps_SchemaChange` XE session. The session writes to a 32 MB ring buffer; `audit.CaptureSchemaChanges` drains it on a schedule (recommended every 5 minutes) and loads new events into the table. Schema names are resolved by catalog lookup against the affected database at capture time, with a sql_text parse fallback for dropped objects.
 
-To audit additional user databases, run `Triggers\trg_SchemaChangeCapture_MANUAL-SETUP.sql` against each target database — it creates the audit schema, table, and trigger in a single idempotent script. Use `Triggers\trg_SchemaChangeCapture.sql` (trigger only) on databases where the audit schema and table already exist.
+`audit.SaLoginHistory` captures query activity executed under the `sa` login, fed by the same `DBAOps_SaActivityMonitor` XE session ring buffer.
+
+Deploy `XESessions\DBAOps_SchemaChange.sql` manually against each instance to enable DDL auditing. Deploy `XESessions\DBAOps_SaActivityMonitor.sql` to enable sa activity capture.
+
+The legacy DDL trigger (`Triggers\trg_SchemaChangeCapture.sql`) is still available as an alternative for environments where XE sessions cannot be used. It captures DDL and permission events via `EVENTDATA()` and writes to the same `audit.SchemaChangeHistory` table — note that the trigger-based columns differ from the XE-based schema (the table was redesigned for the XE approach).
 
 ```sql
--- Recent DDL changes in DBAOps
-SELECT TOP 20 [CapturedAt], [EventType], [SchemaName], [ObjectName], [LoginName], [TSQLCommand]
+-- Recent DDL changes
+SELECT TOP 20
+    [CapturedAt], [EventName], [DatabaseName], [SchemaName],
+    [ObjectName], [ObjectType], [LoginName], [SqlText]
 FROM [DBAOps].[audit].[SchemaChangeHistory]
 ORDER BY [CapturedAt] DESC;
+
+-- Objects with unresolved schema names (review these)
+SELECT [EventTime], [EventName], [DatabaseName], [ObjectName], [SqlText]
+FROM [DBAOps].[audit].[SchemaChangeHistory]
+WHERE [SchemaResolutionMethod] = 'unresolved'
+ORDER BY [EventTime] DESC;
 ```
 
 ## dbo Utility Procedures
@@ -216,23 +230,26 @@ All cleanup procs support `@WhatIf = 1` to preview what would be removed. Schedu
 
 | Proc | Schema | Default Retention | Notes |
 |------|--------|-------------------|-------|
-| `CleanupRollbackData` | deploy | 30 days + 14-day grace | Two-phase: expire then drop data tables |
-| `CleanupRunOnceManifest` | deploy | 90 days (Failed), 365 days (Success) | Pass `-1` for indefinite Success retention |
-| `CleanupDeadlockHistory` | trace | 90 days | |
-| `CleanupBlockingHistory` | trace | 90 days | |
-| `CleanupRpcExecutionHistory` | trace | 90 days | Batched 5,000-row deletes |
-| `CleanupSaActivity` | trace | 90 days | Consider 180 days while sa remediation is active |
-| `CleanupWaitStats` | monitor | 30 days | |
+| `CleanupRollbackData` | `deploy` | 30 days + 14-day grace | Two-phase: expire then drop data tables |
+| `CleanupRunOnceManifest` | `deploy` | 90 days (Failed), 365 days (Success) | Pass `-1` for indefinite Success retention |
+| `CleanupDeadlockHistory` | `trace` | 90 days | |
+| `CleanupBlockingHistory` | `trace` | 90 days | |
+| `CleanupRpcExecutionHistory` | `trace` | 90 days | Batched 5,000-row deletes |
+| `CleanupSaActivity` | `trace` | 90 days | Legacy file-target pipeline |
+| `CleanupWaitStats` | `monitor` | 30 days | |
+| `CleanupSaActivity` | `audit` | 90 days | Ring buffer pipeline |
+| `CleanupSchemaChanges` | `audit` | 90 days | |
 
 ```sql
 -- Preview any cleanup before running
-EXEC [deploy].[CleanupRollbackData]      @WhatIf = 1;
-EXEC [deploy].[CleanupRunOnceManifest]   @WhatIf = 1;
-EXEC [trace].[CleanupDeadlockHistory]    @WhatIf = 1;
-EXEC [trace].[CleanupBlockingHistory]    @WhatIf = 1;
-EXEC [trace].[CleanupRpcExecutionHistory];   -- no @WhatIf; check row count first
-EXEC [trace].[CleanupSaActivity]         @WhatIf = 1;
-EXEC [monitor].[CleanupWaitStats]        @WhatIf = 1;
+EXEC [deploy].[CleanupRollbackData]          @WhatIf = 1;
+EXEC [deploy].[CleanupRunOnceManifest]       @WhatIf = 1;
+EXEC [trace].[CleanupDeadlockHistory]        @WhatIf = 1;
+EXEC [trace].[CleanupBlockingHistory]        @WhatIf = 1;
+EXEC [trace].[CleanupSaActivity]             @WhatIf = 1;
+EXEC [monitor].[CleanupWaitStats]            @WhatIf = 1;
+EXEC [audit].[CleanupSaActivity]             @WhatIf = 1;
+EXEC [audit].[CleanupSchemaChanges]          @WhatIf = 1;
 ```
 
 ## CI/CD Integration

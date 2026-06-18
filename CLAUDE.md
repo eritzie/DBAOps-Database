@@ -10,11 +10,11 @@ Requires the `dbatools` PowerShell module.
 # Core deployment
 .\Deploy-DBAOps.ps1 -SqlInstance SQL-DEV-01
 
-# Core + sa activity capture pipeline + Agent jobs
-.\Deploy-DBAOps.ps1 -SqlInstance SQL-DEV-01 -IncludeSaCapturePipeline -CreateAgentJobs
+# Core + all Agent jobs
+.\Deploy-DBAOps.ps1 -SqlInstance SQL-DEV-01 -CreateAgentJobs
 
-# Non-default XE log path
-.\Deploy-DBAOps.ps1 -SqlInstance SQL-DEV-01 -IncludeSaCapturePipeline -CreateAgentJobs -XELogsPath 'D:\XEvents\'
+# Non-default XE log path for the sa capture job
+.\Deploy-DBAOps.ps1 -SqlInstance SQL-DEV-01 -CreateAgentJobs -XELogsPath 'D:\XEvents\'
 
 # Preview without executing
 .\Deploy-DBAOps.ps1 -SqlInstance SQL-DEV-01 -WhatIf
@@ -38,7 +38,7 @@ DBAOps is a SQL Server database that acts as an operational hub for DBA tooling.
 | `trace` | Deadlock, blocking, RPC execution, and sa login event capture |
 | `monitor` | Cumulative wait statistics snapshots |
 | `dbo` | Instance-diagnostic utility procedures (no DBAOps table dependencies) |
-| `audit` | DDL/permission change history via database-scoped trigger |
+| `audit` | DDL change history (XE ring buffer) and sa login event capture |
 | `maint` | Reserved for future maintenance objects |
 
 ## Directory Layout
@@ -46,17 +46,15 @@ DBAOps is a SQL Server database that acts as an operational hub for DBA tooling.
 Schema-bearing directories (`trace/`, `monitor/`, `deploy/`, `dbo/`, `audit/`) each have `Tables/` and `Stored Procedures/` subdirectories. Top-level directories:
 
 ```
-AgentJobs/      SQL Agent job creation scripts
+AgentJobs/      SQL Agent job creation scripts (standalone; run manually after XE sessions are deployed)
 XESessions/     Extended Events session definitions (manual deploy only)
 ServerAudit/    Server audit and database audit spec scripts (manual deploy only)
-Triggers/       trg_SchemaChangeCapture DDL trigger (manual, per-database)
+Triggers/       trg_SchemaChangeCapture DDL trigger (manual, per-database — legacy alternative to XE pipeline)
 Security/       Schema and role idempotent creation scripts (manual deploy only)
-Setup/          Bootstrap scripts (run once, in order 01–04; 05 is the old sa job script)
+Setup/          Bootstrap scripts run by Deploy-DBAOps.ps1 in order (01–07 core; 08 Agent jobs; 09 XE sessions manual)
 Templates/      DataUpdate and StoredProcedure deployment templates for application teams
 Samples/        CI/CD pipeline examples
 ```
-
-`Setup/05_CreateAgentJobs.sql` is the original two-job sa pipeline script. It is superseded by `AgentJobs/DBAOps-CaptureSaActivity.sql` but kept for reference.
 
 ## SQL File Conventions
 
@@ -88,7 +86,7 @@ Always open with `USE [DBAOps]; GO` before the comment block. Use `CREATE OR ALT
 
 ### XE sessions, Agent jobs, ServerAudit, Triggers
 
-As-is deployment scripts with their own idempotency guards. Use `E:\Audit\` → `C:\Audit\` and `E:\XEvents\` → `C:\XEvents\` as the default path convention for this repo. `DBAOps_SaActivityMonitor.sql` and `DBAOps_ServerAudit.sql` use `:setvar` for their path variables.
+As-is deployment scripts with their own idempotency guards. Use `E:\Audit\` → `C:\Audit\` and `E:\XEvents\` → `C:\XEvents\` as the default path convention for this repo. `DBAOps_ServerAudit.sql` uses `:setvar` for its path variable (SQLCMD mode required). `DBAOps_SaActivityMonitor.sql` no longer requires SQLCMD mode by default — the `:setvar` and file target are commented out; uncomment both only when enabling the optional file target.
 
 ### Schema files — `Security/Schema/*.sql`
 
@@ -110,16 +108,18 @@ GO
 
 ### XE-backed capture pipelines
 
-Four pipelines follow the same shape: XE session (manual deploy) → Capture proc reads buffer/file → Cleanup proc manages retention → Agent job schedules both steps.
+Six pipelines follow the same shape: XE session (manual deploy) → Capture proc reads buffer/file → Cleanup proc manages retention → Agent job schedules both steps.
 
-| Pipeline | XE Session | Capture Proc | Agent Job |
-|----------|-----------|-------------|-----------|
-| Deadlocks | `system_health` (built-in) | `trace.CaptureDeadlocks` | `DBAOps-CaptureDeadlocks.sql` |
-| Blocking | `DBAOps_BlockedProcess` | `trace.CaptureBlockingHistory` | `DBAOps-CaptureBlockingHistory.sql` |
-| RPC Execution | `DBAOps_SpExecutionCapture` | `trace.CaptureRpcExecutions` | `DBAOps-CaptureRpcExecutions.sql` |
-| sa Activity | `DBAOps_SaActivityMonitor` (file target) | `trace.CaptureSaActivity` | `DBAOps-CaptureSaActivity.sql` |
+| Pipeline | Schema | XE Session | Capture Proc | Agent Job |
+|----------|--------|-----------|-------------|-----------|
+| Deadlocks | `trace` | `system_health` (built-in) | `trace.CaptureDeadlocks` | `DBAOps-CaptureDeadlocks.sql` |
+| Blocking | `trace` | `DBAOps_BlockedProcess` | `trace.CaptureBlockingHistory` | `DBAOps-CaptureBlockingHistory.sql` |
+| RPC Execution | `trace` | `DBAOps_SpExecutionCapture` | `trace.CaptureRpcExecutions` | `DBAOps-CaptureRpcExecutions.sql` |
+| sa Activity (trace) | `trace` | `DBAOps_SaActivityMonitor` (file target) | `trace.CaptureSaActivity` | `DBAOps-CaptureSaActivity.sql` |
+| sa Activity (audit) | `audit` | `DBAOps_SaActivityMonitor` (ring buffer) | `audit.CaptureSaActivity` | — |
+| Schema Changes | `audit` | `DBAOps_SchemaChange` (ring buffer) | `audit.CaptureSchemaChanges` | `DBAOps-CaptureSchemaChanges.sql` |
 
-`Deploy-DBAOps.ps1` deploys the deadlock pipeline (table + both procs) as part of core. The other three require their XE session to be running first.
+`Deploy-DBAOps.ps1` deploys the deadlock pipeline (table + both procs) as part of core. The other pipelines require their XE session to be running first. The `audit` sa activity pipeline is the successor to the `trace` version — it uses a ring buffer instead of a file target and stores events in `audit.SaLoginHistory`.
 
 ### Run-once system
 
@@ -135,4 +135,4 @@ The 19 procedures in `dbo/Stored Procedures/` query only DMVs and system catalog
 
 ## README Status
 
-`README.md` reflects the pre-restructure layout (flat `Trace/`, `Monitor/`, `Maintenance/` directories and old script paths). The current structure is schema-based as documented here. Treat this file as authoritative for path references.
+`README.md` reflects the current schema-based layout. Treat this file as authoritative for any behavioral or deployment details not covered there.

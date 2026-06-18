@@ -2,26 +2,29 @@
 Copyright (C) 2026 Eric Ritzie. All rights reserved.
 
 Description:
-    Deploys the DBAOps_SaActivityMonitor XE session with an async file target. Captures
-    sql_batch_completed and rpc_completed events executed under the sa login. Used as an
-    interim security control to record what sa is executing while application
-    re-credentialing is in progress. Session auto-starts on SQL Server restart
-    (STARTUP_STATE = ON).
+    Deploys the DBAOps_SaActivityMonitor XE session. Captures sql_batch_completed and
+    rpc_completed events executed under the sa login. Used as an interim security control
+    to record what sa is executing while application re-credentialing is in progress.
+    Session auto-starts on SQL Server restart (STARTUP_STATE = ON).
 
     Login and logout events are not captured here — they are captured at the server level
     by DBAOps_ServerAudit (SUCCESSFUL_LOGIN_GROUP / FAILED_LOGIN_GROUP), which provides
     tamper-evident, compliance-grade login history for all logins including sa.
 
-    File target path is configured via the :setvar XELogsPath variable — SQLCMD mode
-    required (Query > SQLCMD Mode in SSMS). Default path: C:\XEvents\. The SQL Server
-    service account needs write access; grant with:
-        icacls "C:\XEvents" /grant "NT SERVICE\MSSQL$<instance>:(OI)(CI)F"
+    Targets:
+      Ring buffer (always)  — 32 MB in-memory buffer, read by audit.CaptureSaActivity
+                              on a schedule (recommended: every 5 minutes). Events are
+                              stored in audit.SaLoginHistory. Buffer wraps on overflow;
+                              drain before SQL Server restart to avoid event loss.
 
-    Events are read by the DBAOps - Capture - SaActivity Agent job (recommended: every
-    10 minutes) and inserted into DBAOps.trace.SaLoginHistory.
+      File target (optional) — Uncomment the ADD TARGET block below to also write events
+                              to a persistent .xel file. Required if using the legacy
+                              trace.CaptureSaActivity proc (file-based reader). File path
+                              is set via :setvar XELogsPath — SQLCMD mode required.
 
 Usage Example:
-    -- Enable SQLCMD mode, then run this script.
+    -- Ring buffer only (default): enable SQLCMD mode is not required.
+    -- File target enabled:        enable SQLCMD mode (Query > SQLCMD Mode in SSMS) first.
     -- Verify deployment:
     SELECT [name], [create_time] FROM sys.dm_xe_sessions WHERE [name] = 'DBAOps_SaActivityMonitor';
 
@@ -31,16 +34,12 @@ Change History:
     2026-05-13  Eric Ritzie (eritzie)            Initial creation
     2026-06-09  Eric Ritzie (eritzie)            Removed login/logout events — now covered
                                                  by DBAOps_ServerAudit server audit
+    2026-06-18  Eric Ritzie (eritzie)            Ring buffer added as primary target;
+                                                 file target made optional
 ===============================================================================================*/
 
 -- ============================================================================
--- CONFIGURE: Set XE log path for this instance. Must end with a backslash.
---            Requires SQLCMD mode (Query > SQLCMD Mode in SSMS).
--- ============================================================================
-:setvar XELogsPath "C:\XEvents\"
-
--- ============================================================================
--- SESSION: Async File Target (permanent -- STARTUP_STATE = ON)
+-- SESSION
 -- ============================================================================
 
 IF EXISTS (
@@ -54,8 +53,10 @@ END
 GO
 
 CREATE EVENT SESSION [DBAOps_SaActivityMonitor] ON SERVER
-ADD EVENT sqlserver.sql_batch_completed(
-    ACTION(
+ADD EVENT sqlserver.sql_batch_completed
+(
+    ACTION
+    (
         sqlserver.client_app_name,
         sqlserver.client_hostname,
         sqlserver.database_name,
@@ -64,8 +65,10 @@ ADD EVENT sqlserver.sql_batch_completed(
     )
     WHERE sqlserver.server_principal_name = N'sa'
 ),
-ADD EVENT sqlserver.rpc_completed(
-    ACTION(
+ADD EVENT sqlserver.rpc_completed
+(
+    ACTION
+    (
         sqlserver.client_app_name,
         sqlserver.client_hostname,
         sqlserver.database_name,
@@ -73,12 +76,27 @@ ADD EVENT sqlserver.rpc_completed(
     )
     WHERE sqlserver.server_principal_name = N'sa'
 )
-ADD TARGET package0.asynchronous_file_target(
-    SET filename           = N'$(XELogsPath)sa_activity.xel',
-        max_file_size      = 100,    -- MB per file
-        max_rollover_files = 10      -- 1 GB max total
+ADD TARGET package0.ring_buffer
+(
+    SET max_memory = 32768   -- 32 MB; drain via audit.CaptureSaActivity every 5 minutes
 )
-WITH (
+-- Optional: uncomment to also write events to a persistent file.
+-- Requires SQLCMD mode (Query > SQLCMD Mode in SSMS). Needed only if using
+-- trace.CaptureSaActivity (file-based reader).
+-- Grant write access first:
+--   icacls "C:\XEvents" /grant "NT SERVICE\MSSQL$<instance>:(OI)(CI)F"
+--
+-- Uncomment the three lines below AND the ADD TARGET block:
+-- :setvar XELogsPath "C:\XEvents\"
+--
+-- ,ADD TARGET package0.asynchronous_file_target
+-- (
+--     SET filename           = N'$(XELogsPath)sa_activity.xel',
+--         max_file_size      = 100,    -- MB per file
+--         max_rollover_files = 10      -- 1 GB max total
+-- )
+WITH
+(
     MAX_DISPATCH_LATENCY = 5 SECONDS,
     STARTUP_STATE        = ON
 );
@@ -87,7 +105,7 @@ GO
 ALTER EVENT SESSION [DBAOps_SaActivityMonitor] ON SERVER STATE = START;
 GO
 
-PRINT 'DBAOps_SaActivityMonitor deployed and started (file target: $(XELogsPath)sa_activity.xel).';
+PRINT 'DBAOps_SaActivityMonitor deployed and started (ring buffer target).';
 GO
 
 -- ============================================================================

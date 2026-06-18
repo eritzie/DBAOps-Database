@@ -48,7 +48,8 @@ Desktop.ini
 *.env
 
 # Workflow planning docs (not part of the deliverable)
-handoff-sync-from-odn.md
+handoff*.md
+feedback*.md
 
 # Claude Code
 CLAUDE.local.md
