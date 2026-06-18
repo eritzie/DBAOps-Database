@@ -22,7 +22,7 @@ Requires the `dbatools` PowerShell module.
 
 `Deploy-DBAOps.ps1` strips SQLCMD `:setvar` lines before execution and substitutes `$(XELogsPath)` with the `-XELogsPath` parameter value (default `C:\XEvents\`). It does **not** deploy XE sessions, Security objects, ServerAudit specs, Triggers, or dbo utility procedures — those are all manual.
 
-Install Ola Hallengren's Maintenance Solution separately:
+Ola Hallengren's Maintenance Solution is not part of this repo but is commonly deployed to the same database. Use `-LogToTable` to log to `dbo.CommandLog` (created by Hallengren's installer, not by DBAOps):
 
 ```powershell
 Install-DbaMaintenanceSolution -SqlInstance SQL-DEV-01 -Database DBAOps -InstallJobs -LogToTable -CleanupTime 168

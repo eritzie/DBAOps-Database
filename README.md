@@ -53,7 +53,7 @@ Run the Setup scripts in order in SSMS or via `sqlcmd.exe`:
 :r Setup\09_CreateXESessions_MANUAL-SETUP.sql    -- XE sessions (review per instance before enabling)
 ```
 
-Install Ola Hallengren's Maintenance Solution into the same database:
+Ola Hallengren's Maintenance Solution is not part of DBAOps but is commonly deployed to the same database. `dbo/Tables/CommandLog.sql` in this repo is a reference copy of Hallengren's standard table definition — use `-LogToTable` if deploying his solution here:
 
 ```powershell
 Install-DbaMaintenanceSolution -SqlInstance SQL-DEV-01 -Database DBAOps -InstallJobs -LogToTable -CleanupTime 168
